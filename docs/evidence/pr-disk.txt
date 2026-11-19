@@ -1,0 +1,19 @@
+pr-disk import timing
+
+Record only. There is no pass or fail cap.
+
+The release roundtrip example imported 1000 Basic notes into an empty root. The clock is `Instant` inside the process, around `import_text`. Process start is outside that clock. Each run used a fresh `XDG_DATA_HOME`. The command was `roundtrip --cards 1000`.
+
+The machine had 12 cores. Load average at the start of the three runs was 2.47, 1.97, 1.95. `perf` is not installed, so this record does not name a function inside the import.
+
+Every run exited 0 and printed `1000` and `1000`. The first count is notes added. The second is the requested count. The extra run left `collection.anki21` at 65536 bytes and left `memory.sqlite` in the root. stderr was empty.
+
+Durations in seconds, in run order.
+
+0.013482
+0.012518
+0.014023
+
+Median 0.013482 seconds. Range 0.012518 to 0.014023 seconds.
+
+An extra run, not one of the three, reported 0.013682 seconds inside the import. The process used 0.012851 seconds of user time and 0.002001 seconds of system time. User time is most of the inner duration, so the import is waiting on the CPU in this process. The system time is the collection write.
