@@ -1,0 +1,7 @@
+#separator:Tab
+#html:false
+#notetype:Basic
+#deck:Spanish::Verbs
+#columns:Front	Back	guid
+#guid column:3
+hablar	to speak	abc123XYZ0

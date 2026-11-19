@@ -1,0 +1,8 @@
+#separator:Tab
+#html:false
+#deck:Spanish::Verbs
+#columns:Front	Back	guid	notetype
+#guid column:3
+#notetype column:4
+hablar	to speak	abc123XYZ0	Basic
+nada	nothing	fancyGuid01	Fancy

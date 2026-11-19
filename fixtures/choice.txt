@@ -1,0 +1,7 @@
+#separator:Tab
+#html:false
+#notetype:Choice
+#deck:Popup
+#columns:Prompt	Choices	Correct	Explain	guid
+#guid column:5
+Which of these are FSRS grades?	again|Again;hard|Hard;good|Good;easy|Easy	again good	The crate returns one next state per grade.	gradeGuid01

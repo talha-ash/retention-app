@@ -1,0 +1,22 @@
+pr-format import timing
+
+The release accept example read a 1000-note Basic apkg three times. The file was /tmp/retention-pr-format-1000.apkg (17 KB). Each duration is wall time of that process and includes process start. The runs did not go through cargo. There is no pass or fail cap.
+
+The machine had 12 cores. Load average at the start of the three runs was 4.99, 5.86, 3.98.
+
+Every run exited 0 and printed these lines.
+
+guid n0000
+deck Spanish::Verbs
+notes 1000
+scheduling-applied 0
+
+Durations in seconds, in run order.
+
+0.005068
+0.003947
+0.003695
+
+Median 0.003947 seconds. Range 0.003695 to 0.005068 seconds.
+
+An extra run of the same file, not one of the three, used 0.000863 seconds of user time and 0.002619 seconds of system time, with 372 minor page faults and 0 major faults. A one-note apkg on the same binary took 0.002042 seconds of wall time. The 1000-note command spends most of its time in process start.
