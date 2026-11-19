@@ -1,0 +1,35 @@
+pr-merge timing
+
+Two probes. Both used the release example binary, not cargo. /usr/bin/time is not installed, so each duration is Python time.perf_counter around the process. That includes process start. The machine had 12 cores. Load average before the runs was 2.41, 2.12, 2.52. The pr-format record was not re-run in the same loop.
+
+Accept probe
+
+The same file as pr-format, /tmp/retention-pr-format-1000.apkg. Five runs. Every run exited 0 and printed guid n0000, deck Spanish::Verbs, notes 1000, scheduling-applied 0.
+
+Durations in seconds, in run order.
+
+0.007772
+0.005774
+0.003149
+0.003196
+0.005870
+
+Median 0.005774 seconds. Range 0.003149 to 0.007772 seconds.
+
+The pr-format median is 0.003947 seconds and its range is 0.003695 to 0.005068 seconds. Twice that median is 0.007894 seconds. This median is below that line, and the ranges overlap. The median gap is smaller than this run-to-run range, so there is no measurable difference.
+
+Apply probe
+
+A separate file, /tmp/retention-pr-merge-1000.txt, with 1000 Basic notes. Each run deleted target/apply-state.txt first, so each run added 1000 notes and wrote the snapshot. Five runs. Every run exited 0 and printed added 1000 and retired 0. The state file after the extra run had 1007 lines. That count is the starting note, the 1000 added notes, and the header lines.
+
+Durations in seconds, in run order.
+
+0.009655
+0.006556
+0.008337
+0.007765
+0.005624
+
+Median 0.007765 seconds. Range 0.005624 to 0.009655 seconds.
+
+This median is below twice the pr-format median. The ranges do not overlap. This probe writes the snapshot and matches notes, so it is not the accept probe. An extra run, not one of the five, used 0.005675 seconds of user time and 0.000949 seconds of system time. A one-note file on the same binary took 0.001922 seconds of wall time.
