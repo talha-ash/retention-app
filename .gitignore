@@ -1,0 +1,6 @@
+/target
+/retention-popup
+__pycache__/
+*.pyc
+.cursor/skills/verify-retention-popup/bin/wayland-click
+.cursor/skills/verify-retention-popup/evidence/

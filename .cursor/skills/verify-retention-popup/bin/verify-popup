@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""Drive the retention-popup layer-shell prototype on this Hyprland session."""
+
+import argparse
+import json
+import os
+import signal
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SKILL = Path(__file__).resolve().parents[1]
+REPO = SKILL.parents[2]
+STATE = Path("/tmp/verify-retention-popup.json")
+OPEN_LOGS = []
+CLICK = SKILL / "bin" / "wayland-click"
+NAMESPACES = {"controls": "retention-controls", "card": "retention-card"}
+
+
+def run(cmd, **kwargs):
+    return subprocess.run(cmd, check=True, text=True, **kwargs)
+
+
+def hypr(args):
+    out = subprocess.check_output(["hyprctl", *args], text=True)
+    if args[-1] == "-j":
+        return json.loads(out)
+    return out
+
+
+def surfaces():
+    found = []
+    for monitor, body in hypr(["layers", "-j"]).items():
+        for level, items in body.get("levels", {}).items():
+            for item in items:
+                found.append({"monitor": monitor, "level": str(level), **item})
+    return found
+
+
+def named(kind):
+    namespace = NAMESPACES[kind]
+    return [item for item in surfaces() if item.get("namespace") == namespace]
+
+
+def monitors():
+    data = hypr(["monitors", "-j"])
+    if isinstance(data, dict):
+        data = data.get("monitors", [])
+    return data
+
+
+def monitor_for(item):
+    for mon in monitors():
+        if mon.get("name") == item["monitor"]:
+            return mon
+    raise SystemExit(f"no monitor named {item['monitor']}")
+
+
+def load_state():
+    if not STATE.exists():
+        return None
+    return json.loads(STATE.read_text())
+
+
+def save_state(state):
+    STATE.write_text(json.dumps(state))
+
+
+def evidence_dir():
+    state = load_state()
+    if state is None:
+        raise SystemExit("no verification instance is recorded")
+    path = Path(state["evidence"])
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def ensure_click():
+    source = CLICK.with_suffix(".c")
+    if not CLICK.exists() or source.stat().st_mtime > CLICK.stat().st_mtime:
+        run(["gcc", "-O2", "-Wall", "-Wextra", "-o", str(CLICK), str(source), "-lwayland-client"])
+
+
+def png_size(path):
+    data = Path(path).read_bytes()
+    if data[12:16] != b"IHDR":
+        raise SystemExit(f"{path} is not a png")
+    return struct.unpack(">II", data[16:24])
+
+
+def _tsv_words(path, x_off, y_off, scale, psm):
+    out = subprocess.check_output(
+        ["tesseract", str(path), "stdout", "--psm", str(psm), "tsv"],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+    words = []
+    for line in out.splitlines()[1:]:
+        cols = line.split("\t")
+        if len(cols) < 12 or cols[11].strip() == "":
+            continue
+        try:
+            conf = float(cols[10])
+        except ValueError:
+            continue
+        if conf < 0:
+            continue
+        words.append(
+            {
+                "left": x_off + int(cols[6]) / scale,
+                "top": y_off + int(cols[7]) / scale,
+                "width": int(cols[8]) / scale,
+                "height": int(cols[9]) / scale,
+                "text": cols[11],
+            }
+        )
+    return words
+
+
+def _blue_bands(image):
+    pixels = image.load()
+    width, height = image.size
+    rows = []
+    for y in range(height):
+        blues = 0
+        for x in range(width):
+            red, green, blue = pixels[x, y]
+            if blue > 150 and blue > red + 20:
+                blues += 1
+        rows.append(blues > 40)
+    bands = []
+    start = None
+    for y, hot in enumerate(rows + [False]):
+        if hot and start is None:
+            start = y
+        elif not hot and start is not None:
+            if y - start >= 8:
+                bands.append((start, y))
+            start = None
+    return bands
+
+
+def _binarize_dark_text(image):
+    out = image.copy()
+    pixels = out.load()
+    width, height = out.size
+    for y in range(height):
+        for x in range(width):
+            red, green, blue = pixels[x, y]
+            pixels[x, y] = (255, 255, 255) if (red + green + blue) / 3 > 110 else (0, 0, 0)
+    return out
+
+
+def ocr_words(png):
+    from PIL import Image
+
+    image = Image.open(png).convert("RGB")
+    words = _tsv_words(png, 0, 0, 1, 6)
+    scale = 4
+    for top, bottom in _blue_bands(image):
+        crop = image.crop((0, max(0, top - 6), image.width, min(image.height, bottom + 6)))
+        big = crop.resize((crop.width * scale, crop.height * scale), Image.Resampling.LANCZOS)
+        band = Path(f"/tmp/verify-retention-popup-band-{top}.png")
+        _binarize_dark_text(big).save(band)
+        words.extend(_tsv_words(band, 0, max(0, top - 6), scale, 13))
+    return words
+
+
+def _norm(token):
+    return "".join(ch for ch in token.casefold() if ch.isalnum())
+
+
+def phrase_box(words, phrase):
+    want = [part for part in (_norm(token) for token in phrase.split()) if part]
+    compact = "".join(want)
+    texts = [_norm(word["text"]) for word in words]
+    for start in range(len(texts)):
+        acc = []
+        for end in range(start, len(texts)):
+            acc.append(texts[end])
+            if acc == want or "".join(acc) == compact:
+                chunk = words[start : end + 1]
+                left = min(word["left"] for word in chunk)
+                top = min(word["top"] for word in chunk)
+                right = max(word["left"] + word["width"] for word in chunk)
+                bottom = max(word["top"] + word["height"] for word in chunk)
+                return ((left + right) / 2, (top + bottom) / 2)
+            if len("".join(acc)) > len(compact) + 8:
+                break
+    return None
+
+
+def ocr_text(png, inset=0):
+    path = Path(png)
+    if inset:
+        from PIL import Image
+
+        image = Image.open(path).convert("RGB")
+        image = image.crop((inset, inset, image.width - inset, image.height - inset))
+        path = Path("/tmp/verify-retention-popup-inner.png")
+        image.save(path)
+    return " ".join(word["text"] for word in ocr_words(path))
+
+
+def _label_visible(kind, phrase):
+    png = Path(f"/tmp/verify-retention-popup-{kind}.png")
+    try:
+        shot_surface(kind, png)
+    except (subprocess.CalledProcessError, SystemExit):
+        return False
+    return phrase_box(ocr_words(png), phrase) is not None
+
+
+def shot_surface(kind, dest):
+    found = named(kind)
+    if len(found) != 1:
+        raise SystemExit(f"expected one {kind} surface, found {len(found)}")
+    item = found[0]
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    geom = f"{int(item['x'])},{int(item['y'])} {int(item['w'])}x{int(item['h'])}"
+    run(["grim", "-g", geom, str(dest)])
+    return item
+
+
+def click_text(kind, phrase):
+    ensure_click()
+    item = shot_surface(kind, Path(f"/tmp/verify-retention-popup-{kind}.png"))
+    png = Path(f"/tmp/verify-retention-popup-{kind}.png")
+    words = ocr_words(png)
+    box = phrase_box(words, phrase)
+    if box is None:
+        raise SystemExit(
+            f"{phrase!r} not found on {kind}. OCR was: {ocr_text(png)!r}"
+        )
+    img_w, img_h = png_size(png)
+    gx = item["x"] + box[0] * item["w"] / img_w
+    gy = item["y"] + box[1] * item["h"] / img_h
+    mon = monitor_for(item)
+    local_x = int(round(gx - mon["x"]))
+    local_y = int(round(gy - mon["y"]))
+    if not (0 <= local_x < mon["width"] and 0 <= local_y < mon["height"]):
+        raise SystemExit(f"click {local_x},{local_y} missed monitor {mon['name']}")
+    run(
+        [
+            str(CLICK),
+            "click",
+            str(local_x),
+            str(local_y),
+            str(int(mon["width"])),
+            str(int(mon["height"])),
+            str(mon["name"]),
+        ]
+    )
+    print(f"clicked {phrase!r} on {kind} at {local_x},{local_y}")
+
+
+def wait_surface(kind, timeout, present):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        count = len(named(kind))
+        if present and count == 1:
+            return named(kind)[0]
+        if not present and count == 0:
+            return None
+        time.sleep(0.25)
+    raise SystemExit(
+        f"timed out waiting for {kind} to be {'present' if present else 'gone'}"
+    )
+
+
+def launch():
+    if named("controls") or named("card"):
+        raise SystemExit(
+            "a retention-popup surface is already on this session; refuse to start another"
+        )
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+    evidence = SKILL / "evidence" / run_id
+    evidence.mkdir(parents=True)
+    log = evidence / "launch.log"
+    env = os.environ.copy()
+    env.pop("CARGO_TARGET_DIR", None)
+    log_handle = log.open("w")
+    OPEN_LOGS.append(log_handle)
+    proc = subprocess.Popen(
+        ["mise", "exec", "rust@stable", "--", "cargo", "run", "--release"],
+        cwd=REPO,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env=env,
+    )
+    # Keep the handle alive for the life of the process. Closing it early
+    # delivers SIGPIPE to the app the next time it writes a log line.
+    save_state({"pgid": proc.pid, "evidence": str(evidence)})
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            cleanup()
+            raise SystemExit(f"app exited before the control card appeared\n{log.read_text()[-2000:]}")
+        if len(named("controls")) == 1 and _label_visible("controls", "Show card"):
+            print(f"ready evidence={evidence}")
+            return
+        time.sleep(0.25)
+    cleanup()
+    raise SystemExit(f"control card did not appear\n{log.read_text()[-2000:]}")
+
+
+def doctor():
+    state = load_state()
+    found = named("controls")
+    cards = named("card")
+    problems = []
+    if state is None:
+        problems.append("no recorded instance")
+    if len(found) != 1:
+        problems.append(f"controls surfaces: {len(found)}")
+    else:
+        pid = int(found[0]["pid"])
+        try:
+            pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            pgid = None
+        if state is not None and pgid != state["pgid"]:
+            problems.append(f"controls pid {pid} is not in the recorded process group")
+    if problems:
+        raise SystemExit("doctor fail: " + "; ".join(problems))
+    text = (
+        f"ok\npid {found[0]['pid']}\npgid {state['pgid']}\n"
+        f"controls {len(found)}\ncard {len(cards)}\n"
+        f"evidence {state['evidence']}\n"
+    )
+    print(text, end="")
+    return text
+
+
+def cleanup():
+    state = load_state()
+    if state is None:
+        print("no instance to clean up")
+        return
+    pgid = state["pgid"]
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.time() + 3
+    while time.time() < deadline and _group_alive(pgid):
+        time.sleep(0.1)
+    if _group_alive(pgid):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    STATE.unlink(missing_ok=True)
+    print(f"cleaned up process group {pgid}; evidence kept at {state['evidence']}")
+
+
+def _group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def prove_show_card():
+    launch()
+    try:
+        evidence = evidence_dir()
+        (evidence / "doctor.txt").write_text(doctor())
+        (evidence / "layers-before.json").write_text(json.dumps(hypr(["layers", "-j"]), indent=2))
+        shot_surface("controls", evidence / "controls-before.png")
+        click_text("controls", "Show card")
+        time.sleep(0.4)
+        shot_surface("controls", evidence / "controls-armed.png")
+        armed = ocr_text(evidence / "controls-armed.png")
+        (evidence / "controls-armed.txt").write_text(armed + "\n")
+        armed_compact = "".join(ch for ch in armed.casefold() if ch.isalnum())
+        if "cardappearsin" not in armed_compact or "topright" not in armed_compact:
+            raise SystemExit(f"status after Show card was {armed!r}")
+        card = wait_surface("card", 12, True)
+        (evidence / "layers-card.json").write_text(json.dumps(hypr(["layers", "-j"]), indent=2))
+        shot_surface("card", evidence / "card.png")
+        card_text = ocr_text(evidence / "card.png", inset=96)
+        (evidence / "card.txt").write_text(card_text + "\n")
+        mon = monitor_for(card)
+        center_x = card["x"] + card["w"] / 2
+        center_y = card["y"] + card["h"] / 2
+        top_right = center_x > mon["x"] + mon["width"] / 2 and center_y < mon["y"] + mon["height"] / 2
+        controls_still = len(named("controls")) == 1
+        geometry = (
+            f"card {card['x']},{card['y']} {card['w']}x{card['h']} monitor {mon['name']}\n"
+            f"top_right {str(top_right).lower()}\n"
+            f"controls_still {str(controls_still).lower()}\n"
+        )
+        (evidence / "card-geometry.txt").write_text(geometry)
+        if not top_right or not controls_still:
+            raise SystemExit(geometry)
+        card_compact = "".join(ch for ch in card_text.casefold() if ch.isalnum())
+        if "slipped" not in card_compact:
+            raise SystemExit(f"card text was {card_text!r}")
+        click_text("controls", "Show card")
+        time.sleep(0.4)
+        wait_surface("card", 3, False)
+        shot_surface("controls", evidence / "controls-restarted.png")
+        restarted = ocr_text(evidence / "controls-restarted.png")
+        (evidence / "controls-restarted.txt").write_text(restarted + "\n")
+        if "cardappearsin" not in "".join(ch for ch in restarted.casefold() if ch.isalnum()):
+            raise SystemExit(f"status after the second Show card was {restarted!r}")
+        (evidence / "result.txt").write_text("pass show-card\n")
+        print(f"pass show-card evidence={evidence}")
+    except BaseException:
+        if load_state() is not None:
+            (evidence_dir() / "result.txt").write_text("fail show-card\n")
+        raise
+    finally:
+        cleanup()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("launch")
+    sub.add_parser("doctor")
+    sub.add_parser("cleanup")
+    sub.add_parser("prove-show-card")
+    click = sub.add_parser("click")
+    click.add_argument("--surface", choices=sorted(NAMESPACES), required=True)
+    click.add_argument("--text", required=True)
+    shot = sub.add_parser("shot")
+    shot.add_argument("--surface", choices=sorted(NAMESPACES), required=True)
+    shot.add_argument("--output", required=True)
+    wait = sub.add_parser("wait")
+    wait.add_argument("--surface", choices=sorted(NAMESPACES), required=True)
+    wait.add_argument("--timeout", type=float, required=True)
+    wait.add_argument("--absent", action="store_true")
+    args = parser.parse_args()
+    if args.cmd == "launch":
+        launch()
+    elif args.cmd == "doctor":
+        doctor()
+    elif args.cmd == "cleanup":
+        cleanup()
+    elif args.cmd == "prove-show-card":
+        prove_show_card()
+    elif args.cmd == "click":
+        click_text(args.surface, args.text)
+    elif args.cmd == "shot":
+        shot_surface(args.surface, args.output)
+        print(args.output)
+    elif args.cmd == "wait":
+        wait_surface(args.surface, args.timeout, not args.absent)
+        print("ok")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.CalledProcessError as err:
+        raise SystemExit(f"command failed: {err.cmd}") from err

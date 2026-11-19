@@ -1,0 +1,13 @@
+[package]
+name = "retention-popup"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+iced = { version = "0.14", features = ["smol"] }
+iced_layershell = "0.19"
+
+# Cargo.lock pins winit-common and winit-core to 0.31.0-beta.2.
+# beta.4 adds a key code iced_layershell 0.19 cannot match, and the build breaks.
