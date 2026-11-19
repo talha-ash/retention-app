@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 bytemuck = { version = "1", features = ["derive"] }
+fsrs = "7.0.0"
 iced = { version = "0.14", features = ["smol"] }
 iced_layershell = "0.19"
 rusqlite = { version = "0.37", features = ["bundled", "serialize"] }

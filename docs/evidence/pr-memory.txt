@@ -1,0 +1,19 @@
+pr-memory grade timing
+
+Record only. There is no pass or fail cap.
+
+The release grade example ran `schedule` 1000 times on a new card graded Good. The clock is `Instant` inside the process, around the loop. Process start is outside that clock. The binary was `/tmp/cursor-sandbox-cache/e0e0a24702f359d2e94aa5e4deda3061/cargo-target/release/examples/grade`. The command was `grade --repeat 1000`.
+
+The machine had 12 cores. Load average at the start of the three runs was 7.99, 4.23, 3.06. `perf` is not installed, so this record does not name a function inside the loop.
+
+Every run exited 0 and printed `1700432000` and `1000`. That due instant is 1_700_000_000 plus five days. The same five-day Good step appears in the four-line example. stderr was empty.
+
+Durations in seconds, in run order.
+
+0.004226
+0.004127
+0.005021
+
+Median 0.004226 seconds. Range 0.004127 to 0.005021 seconds.
+
+An extra run, not one of the three, reported 0.004124 seconds inside the loop. The process used 0.003992 seconds of user time and 0.000998 seconds of system time. User time is most of the inner duration, so the loop is waiting on the CPU in this process.
