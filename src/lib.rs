@@ -1,8 +1,10 @@
+mod delivery;
 mod format;
 mod memory;
 mod merge;
 mod model;
 
+pub use delivery::{DeckDelivery, Delivery, DueCard, Gap, Show, Window, per_deck_shows};
 pub use format::{FormatError, accept_apkg, accept_path, accept_text};
 pub use memory::{Grade, Scheduled, grade_choice, schedule};
 pub use merge::{ApplyReport, Library, apply_apkg, apply_text};

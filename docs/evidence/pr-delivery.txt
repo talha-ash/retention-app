@@ -1,0 +1,19 @@
+pr-delivery wake timing
+
+Record only. There is no pass or fail cap.
+
+The release wake example ran `per_deck_shows` once on 10000 cards. Every card is due at 09:00 in one inherited deck. The root window is 09:00 to 18:00 and the root gap is 45 minutes. The clock is `Instant` inside the process, around that one call. Process start is outside that clock. The command was `wake --cards 10000`.
+
+The machine had 12 cores. Load average at the start of the three runs was 4.52, 6.03, 4.74. `perf` is not installed, so this record does not name a function inside the scan.
+
+Every run exited 0 and printed `12` and `10000`. Twelve shows is one card every 45 minutes from 09:00 through 17:15. The window end is 18:00 and that minute is outside the window. stderr was empty.
+
+Durations in seconds, in run order.
+
+0.115297
+0.090019
+0.085995
+
+Median 0.090019 seconds. Range 0.085995 to 0.115297 seconds.
+
+An extra run, not one of the three, reported 0.082080 seconds inside the call. The process used 0.082968 seconds of user time and 0.000998 seconds of system time. User time is the inner duration, so the scan is waiting on the CPU in this process.
