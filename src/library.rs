@@ -78,7 +78,7 @@ impl Catalog {
             let Ok(name) = entry.file_name().into_string() else {
                 continue;
             };
-            if name.ends_with(".txt") || name.ends_with(".apkg") {
+            if name.ends_with(".txt") || name.ends_with(".tsv") || name.ends_with(".apkg") {
                 names.push(name);
             }
         }
@@ -517,10 +517,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "retention-library-{}-{n}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("retention-library-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -596,7 +594,11 @@ mod tests {
         let dir = temp_dir();
         let inbox = dir.join("inbox");
         std::fs::create_dir_all(&inbox).unwrap();
-        std::fs::write(inbox.join("basic.txt"), include_str!("../fixtures/basic.txt")).unwrap();
+        std::fs::write(
+            inbox.join("basic.txt"),
+            include_str!("../fixtures/basic.txt"),
+        )
+        .unwrap();
         let mut catalog = Catalog::load(&dir);
         catalog.create_root().unwrap();
         catalog.import_inbox("basic.txt").unwrap();
@@ -661,10 +663,7 @@ mod tests {
                 gap_seconds: None,
             }
         );
-        assert_eq!(
-            catalog.set_root_rules(10, 10, 10),
-            Err(Error::BadWindow)
-        );
+        assert_eq!(catalog.set_root_rules(10, 10, 10), Err(Error::BadWindow));
         assert_eq!(catalog.root_rules().unwrap().start, 0);
         catalog.delete_root("notes").unwrap();
         assert!(catalog.root_ids().is_empty());
@@ -677,7 +676,11 @@ mod tests {
         let dir = temp_dir();
         let inbox = dir.join("inbox");
         std::fs::create_dir_all(&inbox).unwrap();
-        std::fs::write(inbox.join("basic.txt"), include_str!("../fixtures/basic.txt")).unwrap();
+        std::fs::write(
+            inbox.join("basic.txt"),
+            include_str!("../fixtures/basic.txt"),
+        )
+        .unwrap();
         let mut catalog = Catalog::load(&dir);
         catalog.create_root().unwrap();
         catalog.import_inbox("basic.txt").unwrap();
@@ -703,6 +706,18 @@ mod tests {
         let text = std::fs::read_to_string(catalog.export_notes().unwrap()).unwrap();
         assert!(!text.contains("abc123XYZ0"));
         assert!(catalog.decks().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn inbox_lists_tsv_and_skips_csv() {
+        let dir = temp_dir();
+        let inbox = dir.join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::write(inbox.join("notes.tsv"), "x").unwrap();
+        std::fs::write(inbox.join("notes.csv"), "x").unwrap();
+        let catalog = Catalog::load(&dir);
+        assert_eq!(catalog.inbox(), vec!["notes.tsv".to_string()]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

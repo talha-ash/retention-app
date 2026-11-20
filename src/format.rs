@@ -76,11 +76,13 @@ fn kind_of(name: &str) -> Option<Kind> {
 
 struct Headers {
     separator: char,
+    html: bool,
     notetype: Option<String>,
     deck: Option<String>,
     guid_column: Option<usize>,
     notetype_column: Option<usize>,
     deck_column: Option<usize>,
+    tags_column: Option<usize>,
     columns: Option<Vec<String>>,
 }
 
@@ -91,11 +93,9 @@ pub fn accept_text(text: &str) -> Result<Import, FormatError> {
     for line in rows {
         let values = split_row(line, headers.separator);
         let guid_raw = cell(&values, headers.guid_column).trim();
-        let Some(guid) = Guid::new(guid_raw) else {
-            return Err(FormatError::EmptyGuid);
-        };
         let notetype = resolved(&headers.notetype, headers.notetype_column, &values);
         if notetype.is_empty() {
+            let guid = Guid::new(guid_raw).ok_or(FormatError::EmptyGuid)?;
             return Err(FormatError::MissingNoteType { guid });
         }
         let Some(kind) = kind_of(&notetype) else {
@@ -104,9 +104,16 @@ pub fn accept_text(text: &str) -> Result<Import, FormatError> {
         };
         let deck_raw = resolved(&headers.deck, headers.deck_column, &values);
         let Some(deck) = DeckName::new(deck_raw) else {
+            let guid = Guid::new(guid_raw).ok_or(FormatError::EmptyGuid)?;
             return Err(FormatError::MissingDeck { guid });
         };
         let fields = text_fields(&headers, kind, &values);
+        let guid = if guid_raw.is_empty() {
+            let front = fields.get("Front").map(String::as_str).unwrap_or("");
+            stable_guid(deck.as_str(), front).ok_or(FormatError::EmptyGuid)?
+        } else {
+            Guid::new(guid_raw).ok_or(FormatError::EmptyGuid)?
+        };
         let body = body_from_fields(&guid, kind, &fields)?;
         notes.push(Note { guid, deck, body });
     }
@@ -166,24 +173,26 @@ fn parse_headers(lines: &[&str]) -> Result<Headers, FormatError> {
             continue;
         };
         if key == "separator" {
-            separator = match value {
-                "Tab" => '\t',
-                "Comma" => ',',
-                other => {
-                    return Err(FormatError::BadSeparator {
-                        value: other.to_string(),
-                    });
-                }
-            };
+            if value.eq_ignore_ascii_case("tab") {
+                separator = '\t';
+            } else if value.eq_ignore_ascii_case("comma") {
+                separator = ',';
+            } else {
+                return Err(FormatError::BadSeparator {
+                    value: value.to_string(),
+                });
+            }
         }
     }
     let mut headers = Headers {
         separator,
+        html: false,
         notetype: None,
         deck: None,
         guid_column: None,
         notetype_column: None,
         deck_column: None,
+        tags_column: None,
         columns: None,
     };
     for line in lines {
@@ -191,12 +200,14 @@ fn parse_headers(lines: &[&str]) -> Result<Headers, FormatError> {
             continue;
         };
         match key {
-            "separator" | "html" => {}
+            "separator" => {}
+            "html" => headers.html = value.eq_ignore_ascii_case("true"),
             "notetype" => headers.notetype = Some(value.to_string()),
             "deck" => headers.deck = Some(value.to_string()),
             "guid column" => headers.guid_column = Some(column_index(value, "guid")?),
             "notetype column" => headers.notetype_column = Some(column_index(value, "notetype")?),
             "deck column" => headers.deck_column = Some(column_index(value, "deck")?),
+            "tags column" => headers.tags_column = Some(column_index(value, "tags")?),
             "columns" => {
                 if !value.is_empty() {
                     headers.columns = Some(
@@ -219,6 +230,106 @@ fn column_index(value: &str, name: &'static str) -> Result<usize, FormatError> {
         return Err(FormatError::BadColumn { name });
     }
     Ok(parsed - 1)
+}
+
+fn stored_field(headers: &Headers, value: &str) -> String {
+    let text = field_text(value);
+    if headers.html { html_text(&text) } else { text }
+}
+
+fn html_text(value: &str) -> String {
+    strip_tags(&decode_entities(&replace_breaks(value)))
+}
+
+fn replace_breaks(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find('<') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        if let Some(len) = break_len(after) {
+            out.push('\n');
+            rest = &after[len..];
+        } else {
+            out.push('<');
+            rest = &after[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn break_len(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    if bytes.first() != Some(&b'<') {
+        return None;
+    }
+    let name = value.get(1..3)?;
+    if !name.eq_ignore_ascii_case("br") {
+        return None;
+    }
+    let mut index = 3;
+    if bytes.get(index) == Some(&b' ') {
+        index += 1;
+    }
+    if bytes.get(index) == Some(&b'/') {
+        index += 1;
+    }
+    if bytes.get(index) == Some(&b' ') {
+        index += 1;
+    }
+    if bytes.get(index) == Some(&b'>') {
+        Some(index + 1)
+    } else {
+        None
+    }
+}
+
+fn decode_entities(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+fn strip_tags(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find('<') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        if let Some(end) = after.find('>') {
+            rest = &after[end + 1..];
+        } else {
+            out.push('<');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn stable_guid(deck: &str, front: &str) -> Option<Guid> {
+    let front = front.trim();
+    if front.is_empty() {
+        return None;
+    }
+    let mut hash: u64 = 14_695_981_039_346_656_037;
+    for byte in deck
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(std::iter::once(0))
+        .chain(front.as_bytes().iter().copied())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+    Guid::new(format!("{hash:016x}"))
 }
 
 fn field_text(value: &str) -> String {
@@ -246,6 +357,13 @@ fn split_row(line: &str, separator: char) -> Vec<&str> {
     line.split(separator).collect()
 }
 
+fn skipped_column(headers: &Headers, index: usize) -> bool {
+    headers.guid_column == Some(index)
+        || headers.notetype_column == Some(index)
+        || headers.deck_column == Some(index)
+        || headers.tags_column == Some(index)
+}
+
 fn cell<'a>(values: &[&'a str], index: Option<usize>) -> &'a str {
     index.and_then(|i| values.get(i)).copied().unwrap_or("")
 }
@@ -269,23 +387,23 @@ fn text_fields(headers: &Headers, kind: Kind, values: &[&str]) -> HashMap<String
                 continue;
             }
             let value = values.get(index).copied().unwrap_or("");
-            map.insert(name.clone(), field_text(value));
+            map.insert(name.clone(), stored_field(headers, value));
         }
         return map;
     }
     if matches!(kind, Kind::Basic | Kind::Reversed) {
         let mut kept = Vec::new();
         for (index, value) in values.iter().enumerate() {
-            if headers.guid_column == Some(index) {
+            if skipped_column(headers, index) {
                 continue;
             }
             kept.push(*value);
         }
         if let Some(front) = kept.first() {
-            map.insert("Front".to_string(), field_text(front));
+            map.insert("Front".to_string(), stored_field(headers, front));
         }
         if let Some(back) = kept.get(1) {
-            map.insert("Back".to_string(), field_text(back));
+            map.insert("Back".to_string(), stored_field(headers, back));
         }
     }
     map
@@ -862,5 +980,57 @@ hablar\tto speak\trevGuid0001
             other => panic!("{other:?}"),
         }
         assert_eq!(note.body.study_cards(), 2);
+    }
+
+    fn word_row() -> &'static str {
+        "\
+#separator:tab
+#html:true
+#notetype column:1
+#deck column:2
+#tags column:5
+Basic\tWords\tself-conscious\tA &amp; B<br>* hi\ttag
+"
+    }
+
+    #[test]
+    fn a_tab_file_without_a_guid_keeps_the_word() {
+        let import = accept_text(word_row()).unwrap();
+        let note = &import.notes[0];
+        assert_eq!(note.guid.as_str().len(), 16);
+        assert!(note.guid.as_str().chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert_eq!(note.deck.as_str(), "Words");
+        match &note.body {
+            NoteBody::Basic { front, back } => {
+                assert_eq!(front, "self-conscious");
+                assert_eq!(back, "A & B\n* hi");
+                assert!(!back.contains("<br>"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let again = accept_text(word_row()).unwrap();
+        assert_eq!(again.notes[0].guid, note.guid);
+        let other = accept_text(word_row().replace("self-conscious", "banal").as_str()).unwrap();
+        assert_ne!(other.notes[0].guid, note.guid);
+    }
+
+    #[test]
+    fn html_false_keeps_the_guid_and_the_back() {
+        let text = "\
+#separator:Tab
+#html:false
+#notetype:Basic
+#deck:D
+#columns:Front\tBack\tguid
+#guid column:3
+word\tA<br>B &amp; C\tkeepme
+";
+        let import = accept_text(text).unwrap();
+        let note = &import.notes[0];
+        assert_eq!(note.guid.as_str(), "keepme");
+        match &note.body {
+            NoteBody::Basic { back, .. } => assert_eq!(back, "A<br>B &amp; C"),
+            other => panic!("{other:?}"),
+        }
     }
 }
