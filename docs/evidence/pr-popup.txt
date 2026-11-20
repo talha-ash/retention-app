@@ -1,0 +1,10 @@
+Three grades on one due Basic card. Each time is from the Again click returning to the retention-card layer leaving. The number is the compositor plus the app.
+
+run 1  115 ms
+run 2  111 ms
+run 3  105 ms
+
+median 111 ms
+range 105 ms to 115 ms
+
+The card was still absent about 2.2 seconds after the click, and it was back at 8.1 seconds. The deck gap for that fixture was 5 seconds.

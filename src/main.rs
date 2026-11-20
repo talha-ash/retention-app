@@ -1,16 +1,16 @@
-//! Corner-popup prototype. A centered control card waits, then a second
-//! layer-shell card appears in the corner you picked.
+//! Control card, and a due card in the corner you picked.
 
+mod session;
 mod smoke;
 
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use iced::widget::shader::Shader;
-use iced::widget::{button, column, container, row, text, Stack};
 use iced::gradient::Linear;
+use iced::widget::shader::Shader;
+use iced::widget::{button, column, container, row, text, Column, Stack};
 use iced::{
-    Alignment, Background, Border, Color, Element, Length, Radians, Shadow, Subscription, Task,
-    Theme, Vector,
+    Background, Border, Color, Element, Length, Radians, Shadow, Subscription, Task, Theme, Vector,
 };
 use iced_layershell::build_pattern::daemon;
 use iced_layershell::reexport::{
@@ -18,6 +18,7 @@ use iced_layershell::reexport::{
 };
 use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
 use iced_layershell::to_layer_message;
+use rusqlite::{Connection, params};
 
 const BG: Color = Color::from_rgb8(0x1a, 0x1b, 0x26);
 const CARD: Color = Color::from_rgb8(0x24, 0x28, 0x3b);
@@ -33,7 +34,10 @@ const POPUP_SIZE: (u32, u32) = (652, 552);
 const MARGIN: i32 = 16;
 
 fn main() -> iced_layershell::Result {
-    daemon(App::new, "retention-controls", App::update, App::view)
+    let Some(pid_file) = claim_process() else {
+        std::process::exit(0);
+    };
+    let result = daemon(App::new, "retention-controls", App::update, App::view)
         .subscription(App::subscription)
         .theme(|_: &App, _: iced::window::Id| Theme::Dark)
         .style(|_, theme| iced::theme::Style {
@@ -42,7 +46,6 @@ fn main() -> iced_layershell::Result {
         })
         .settings(Settings {
             layer_settings: LayerShellSettings {
-                // No edges: the compositor centers this one. The popup is the anchored card.
                 anchor: Anchor::empty(),
                 layer: Layer::Top,
                 exclusive_zone: 0,
@@ -55,16 +58,69 @@ fn main() -> iced_layershell::Result {
             ..Default::default()
         })
         .antialiasing(false)
-        .run()
+        .run();
+    drop(pid_file);
+    result
+}
+
+struct PidFile {
+    path: PathBuf,
+    pid: u32,
+}
+
+impl Drop for PidFile {
+    fn drop(&mut self) {
+        let owned = std::fs::read_to_string(&self.path)
+            .ok()
+            .is_some_and(|text| text.trim() == self.pid.to_string());
+        if owned {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn claim_process() -> Option<PidFile> {
+    let path = pid_path();
+    let pid = std::process::id();
+    let recorded = std::fs::read_to_string(&path)
+        .ok()
+        .as_deref()
+        .and_then(parse_pid);
+    if pid_busy(recorded, pid, proc_alive) {
+        return None;
+    }
+    let _ = std::fs::write(&path, format!("{pid}\n"));
+    Some(PidFile { path, pid })
+}
+
+fn pid_path() -> PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("retention-popup.pid"),
+        _ => PathBuf::from("/tmp/retention-popup.pid"),
+    }
+}
+
+fn parse_pid(text: &str) -> Option<u32> {
+    text.trim().parse().ok()
+}
+
+fn proc_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn pid_busy(recorded: Option<u32>, self_pid: u32, alive: impl Fn(u32) -> bool) -> bool {
+    match recorded {
+        Some(pid) if pid != self_pid && alive(pid) => true,
+        _ => false,
+    }
 }
 
 struct App {
-    delay_secs: u64,
     corner: Corner,
-    /// Seconds left before the card opens. `None` means we are not waiting.
-    remaining: Option<u64>,
+    offset: i64,
+    study: Option<Study>,
     popup_id: Option<iced::window::Id>,
-    answer: Option<&'static str>,
+    open: Option<OpenCard>,
     opened_at: Option<Instant>,
     smoke_time: f32,
 }
@@ -100,98 +156,73 @@ impl Corner {
 #[to_layer_message(multi)]
 #[derive(Debug, Clone)]
 enum Message {
-    Delay(u64),
     Pick(Corner),
-    Arm,
     Tick,
-    Answer(&'static str),
-    ClosePopup,
+    ShowAnswer,
+    Toggle(String),
+    Continue,
+    Grade(retention_popup::Grade),
     Glow,
     Quit,
 }
 
 impl App {
     fn new() -> Self {
+        let requested = std::env::var("RETENTION_ROOT").ok();
+        let study = data_dir().and_then(|dir| {
+            choose_root(&dir, requested.as_deref().filter(|id| !id.is_empty()))
+                .and_then(|id| load_study(&dir, &id))
+        });
         Self {
-            delay_secs: 5,
             corner: Corner::TopRight,
-            remaining: None,
+            offset: startup_offset(),
+            study,
             popup_id: None,
-            answer: None,
+            open: None,
             opened_at: None,
             smoke_time: 0.0,
         }
     }
 
     fn subscription(state: &Self) -> Subscription<Message> {
-        let countdown = state.remaining.is_some().then(|| {
-            iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick)
-        });
+        let tick = iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick);
         let smoke = state.popup_id.is_some().then(|| {
             iced::time::every(Duration::from_millis(32)).map(|_| Message::Glow)
         });
-        Subscription::batch(countdown.into_iter().chain(smoke))
+        Subscription::batch(std::iter::once(tick).chain(smoke))
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Delay(secs) => {
-                self.delay_secs = secs;
-                Task::none()
-            }
             Message::Pick(corner) => {
                 self.corner = corner;
                 Task::none()
             }
-            Message::Arm => {
-                self.remaining = Some(self.delay_secs);
-                self.answer = None;
-                self.opened_at = None;
-                self.smoke_time = 0.0;
-                match self.popup_id.take() {
-                    Some(id) => Task::done(Message::RemoveWindow(id)),
-                    None => Task::none(),
+            Message::Tick => self.open_due(),
+            Message::ShowAnswer => {
+                if let Some(open) = self.open.as_mut() {
+                    open.revealed = true;
                 }
-            }
-            Message::Tick => match self.remaining {
-                Some(1) | Some(0) => {
-                    self.remaining = None;
-                    if self.popup_id.is_some() {
-                        return Task::none();
-                    }
-                    let (id, task) = Message::layershell_open(NewLayerShellSettings {
-                        size: Some(POPUP_SIZE),
-                        layer: Layer::Top,
-                        anchor: self.corner.anchor(),
-                        exclusive_zone: Some(0),
-                        margin: Some((MARGIN, MARGIN, MARGIN, MARGIN)),
-                        keyboard_interactivity: KeyboardInteractivity::OnDemand,
-                        output_option: OutputOption::Active,
-                        events_transparent: false,
-                        namespace: Some("retention-card".into()),
-                    });
-                    self.popup_id = Some(id);
-                    self.opened_at = Some(Instant::now());
-                    task
-                }
-                Some(secs) => {
-                    self.remaining = Some(secs - 1);
-                    Task::none()
-                }
-                None => Task::none(),
-            },
-            Message::Answer(label) => {
-                self.answer = Some(label);
                 Task::none()
             }
-            Message::ClosePopup => {
-                self.opened_at = None;
-                self.smoke_time = 0.0;
-                match self.popup_id.take() {
-                    Some(id) => Task::done(Message::RemoveWindow(id)),
+            Message::Toggle(id) => {
+                if let Some(open) = self.open.as_mut() {
+                    if let Some(at) = open.selected.iter().position(|have| have == &id) {
+                        open.selected.remove(at);
+                    } else {
+                        open.selected.push(id);
+                    }
+                }
+                Task::none()
+            }
+            Message::Continue => {
+                let grade = self.choice_grade();
+                match grade {
+                    Some(grade) => self.grade(grade),
                     None => Task::none(),
                 }
             }
+            Message::Grade(grade) => self.grade(grade),
             Message::Glow => {
                 if let Some(start) = self.opened_at {
                     self.smoke_time = start.elapsed().as_secs_f32();
@@ -203,6 +234,111 @@ impl App {
         }
     }
 
+    fn choice_grade(&self) -> Option<retention_popup::Grade> {
+        let open = self.open.as_ref()?;
+        let FaceBody::Choice { correct, .. } = &open.face.body else {
+            return None;
+        };
+        let selected: Vec<&str> = open.selected.iter().map(String::as_str).collect();
+        let correct: Vec<&str> = correct.iter().map(String::as_str).collect();
+        Some(retention_popup::grade_choice(&selected, &correct))
+    }
+
+    fn grade(&mut self, grade: retention_popup::Grade) -> Task<Message> {
+        if self.open.as_ref().is_some_and(|open| open.persisted) {
+            return self.close_after_shown();
+        }
+        let Some(face) = self.open.as_ref().map(|open| open.face.clone()) else {
+            return Task::none();
+        };
+        let now = unix_now();
+        let saved = if let Some(study) = self.study.as_mut() {
+            study.save_grade(&face, grade, now)
+        } else {
+            return Task::none();
+        };
+        match saved {
+            Save::Done => self.dismiss(),
+            Save::MemoryOnly => {
+                if let Some(open) = self.open.as_mut() {
+                    open.persisted = true;
+                }
+                Task::none()
+            }
+            Save::Held => Task::none(),
+        }
+    }
+
+    fn close_after_shown(&mut self) -> Task<Message> {
+        let wrote = self
+            .study
+            .as_ref()
+            .is_some_and(|study| write_shown(study).is_ok());
+        if !wrote {
+            return Task::none();
+        }
+        self.dismiss()
+    }
+
+    fn dismiss(&mut self) -> Task<Message> {
+        self.open = None;
+        self.opened_at = None;
+        self.smoke_time = 0.0;
+        match self.popup_id.take() {
+            Some(id) => Task::done(Message::RemoveWindow(id)),
+            None => Task::none(),
+        }
+    }
+
+    fn open_due(&mut self) -> Task<Message> {
+        if self.popup_id.is_some() {
+            return Task::none();
+        }
+        let now = unix_now();
+        let Some(minute) = local_minute(now, self.offset) else {
+            return Task::none();
+        };
+        let Some(study) = self.study.as_ref() else {
+            return Task::none();
+        };
+        let Some(picked) = study.session.pick(session::Unix::new(now), minute) else {
+            return Task::none();
+        };
+        let Some(face) = study
+            .faces
+            .iter()
+            .find(|face| {
+                face.deck == picked.deck.as_str()
+                    && face.guid == picked.guid.as_str()
+                    && face.ord == picked.ord.get()
+            })
+            .cloned()
+        else {
+            return Task::none();
+        };
+        self.open = Some(OpenCard {
+            face,
+            revealed: false,
+            selected: Vec::new(),
+            persisted: false,
+        });
+        let (id, task) = Message::layershell_open(NewLayerShellSettings {
+            size: Some(POPUP_SIZE),
+            layer: Layer::Top,
+            anchor: self.corner.anchor(),
+            exclusive_zone: Some(0),
+            margin: Some((MARGIN, MARGIN, MARGIN, MARGIN)),
+            keyboard_interactivity: KeyboardInteractivity::None,
+            output_option: OutputOption::Active,
+            events_transparent: false,
+            namespace: Some("retention-card".into()),
+        });
+        self.popup_id = Some(id);
+        self.opened_at = Some(Instant::now());
+        self.smoke_time = 0.0;
+        task
+    }
+
     fn view(&self, id: iced::window::Id) -> Element<'_, Message> {
         if self.popup_id == Some(id) {
             Stack::with_children([
@@ -212,7 +348,7 @@ impl App {
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into(),
-                container(quest_card(self.popup()))
+                container(quest_card(self.study_card()))
                     .padding(smoke::PAD)
                     .width(Length::Fill)
                     .height(Length::Fill)
@@ -227,32 +363,8 @@ impl App {
     }
 
     fn controls(&self) -> Element<'_, Message> {
-        let status = if self.popup_id.is_some() {
-            "Card is open. Close it with ×.".to_string()
-        } else if let Some(secs) = self.remaining {
-            format!("Card appears in {secs}s, {}", self.corner.label().to_lowercase())
-        } else {
-            "Pick a delay and a corner, then show the card.".to_string()
-        };
-
-        let show = if self.remaining.is_some() {
-            "Restart timer"
-        } else {
-            "Show card"
-        };
-
         column![
-            text("Popup test").size(28).color(FG),
-            text("The card is its own window. This panel stays here.")
-                .size(14)
-                .color(MUTED),
-            text("Delay").size(13).color(MUTED),
-            row![
-                chip("5 seconds", self.delay_secs == 5, Message::Delay(5)),
-                chip("10 seconds", self.delay_secs == 10, Message::Delay(10)),
-                chip("30 seconds", self.delay_secs == 30, Message::Delay(30)),
-            ]
-            .spacing(8),
+            text("Retention").size(28).color(FG),
             text("Corner").size(13).color(MUTED),
             row![
                 chip(
@@ -280,23 +392,6 @@ impl App {
                 ),
             ]
             .spacing(8),
-            button(text(show).size(16).color(BG))
-                .on_press(Message::Arm)
-                .width(Length::Fill)
-                .style(|_, status| button::Style {
-                    background: Some(Background::Color(match status {
-                        button::Status::Hovered => Color::from_rgb8(0x89, 0xb4, 0xfa),
-                        button::Status::Pressed => Color::from_rgb8(0x5d, 0x8a, 0xe0),
-                        _ => ACCENT,
-                    })),
-                    text_color: BG,
-                    border: Border {
-                        radius: 12.0.into(),
-                        ..Border::default()
-                    },
-                    ..button::Style::default()
-                }),
-            text(status).size(14).color(FG),
             button(text("Quit").size(14).color(MUTED))
                 .on_press(Message::Quit)
                 .style(|_, _| button::Style {
@@ -314,75 +409,51 @@ impl App {
         .into()
     }
 
-    fn popup(&self) -> Element<'_, Message> {
-        let place = self.corner.label().to_lowercase();
-        let footer = match self.answer {
-            Some(label) => text(format!("Path locked  ·  {label}"))
-                .size(13)
-                .color(GOLD_HOT),
-            None => text("Two paths. Pick one.").size(13).color(MUTED),
+    fn study_card(&self) -> Element<'_, Message> {
+        let Some(open) = &self.open else {
+            return Column::new().into();
         };
-
-        column![
-            row![
-                text("QUEST").size(12).color(GOLD),
-                text("01").size(12).color(MUTED),
-                iced::widget::space::horizontal(),
-                button(text("×").size(16).color(GOLD))
-                    .on_press(Message::ClosePopup)
-                    .padding([4, 10])
-                    .style(|_, status| button::Style {
-                        background: Some(Background::Color(Color::from_rgba8(
-                            0xe8,
-                            0xc3,
-                            0x72,
-                            if status == button::Status::Hovered {
-                                0.18
-                            } else {
-                                0.0
-                            },
-                        ))),
-                        text_color: GOLD,
-                        border: Border {
-                            radius: 999.0.into(),
-                            width: 1.0,
-                            color: GOLD,
-                        },
-                        ..button::Style::default()
-                    }),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-            container(iced::widget::space::horizontal())
-                .width(Length::Fill)
-                .height(Length::Fixed(2.0))
-                .style(|_| container::Style {
-                    background: Some(Background::Color(GOLD)),
-                    ..Default::default()
-                }),
-            text("A card slipped in.").size(26).color(FG),
-            text(format!("You called it to the {place}."))
-                .size(14)
-                .color(MUTED),
-            choice(
-                "A",
-                "Yes. This corner.",
-                "Hold this position",
-                "right corner",
-                self.answer == Some("right corner"),
-            ),
-            choice(
-                "B",
-                "No. Wrong spot.",
-                "It landed somewhere else",
-                "wrong place",
-                self.answer == Some("wrong place"),
-            ),
-            footer,
-        ]
-        .spacing(12)
-        .into()
+        match &open.face.body {
+            FaceBody::Sides { prompt, answer } => {
+                if open.revealed {
+                    column![
+                        prompt_text(prompt),
+                        prompt_text(answer),
+                        row![
+                            gold_button("Again", Message::Grade(retention_popup::Grade::Again)),
+                            gold_button("Hard", Message::Grade(retention_popup::Grade::Hard)),
+                            gold_button("Good", Message::Grade(retention_popup::Grade::Good)),
+                            gold_button("Easy", Message::Grade(retention_popup::Grade::Easy)),
+                        ]
+                        .spacing(8),
+                    ]
+                    .spacing(12)
+                    .into()
+                } else {
+                    column![
+                        prompt_text(prompt),
+                        gold_button("Show answer", Message::ShowAnswer),
+                    ]
+                    .spacing(12)
+                    .into()
+                }
+            }
+            FaceBody::Choice {
+                prompt, choices, ..
+            } => {
+                let mut col = column![prompt_text(prompt)].spacing(12);
+                for (id, label) in choices {
+                    let on = open.selected.iter().any(|picked| picked == id);
+                    col = col.push(choice_row(label, on, Message::Toggle(id.clone())));
+                }
+                col.push(gold_button("Continue", Message::Continue)).into()
+            }
+        }
     }
+}
+
+fn prompt_text<'a>(value: &'a str) -> Element<'a, Message> {
+    text(value).size(22).color(FG).into()
 }
 
 fn card(inner: Element<'_, Message>) -> Element<'_, Message> {
@@ -469,48 +540,36 @@ fn quest_card(inner: Element<'_, Message>) -> Element<'_, Message> {
         .into()
 }
 
-fn choice(
-    letter: &'static str,
-    title: &'static str,
-    detail: &'static str,
-    recorded: &'static str,
-    on: bool,
-) -> Element<'static, Message> {
-    let mark = container(text(letter).size(15).color(if on { INK } else { GOLD }))
-        .width(34)
-        .height(34)
-        .align_x(Alignment::Center)
-        .align_y(Alignment::Center)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(if on {
-                GOLD_HOT
-            } else {
-                Color::from_rgba8(0xe8, 0xc3, 0x72, 0.12)
-            })),
+fn gold_button<'a>(label: &'a str, message: Message) -> Element<'a, Message> {
+    button(text(label).size(16).color(GOLD))
+        .on_press(message)
+        .width(Length::Fill)
+        .padding([8, 12])
+        .style(|_, status| button::Style {
+            background: Some(Background::Color(Color::from_rgba8(
+                0xe8,
+                0xc3,
+                0x72,
+                if status == button::Status::Hovered {
+                    0.18
+                } else {
+                    0.0
+                },
+            ))),
+            text_color: GOLD,
             border: Border {
-                radius: 10.0.into(),
+                radius: 12.0.into(),
                 width: 1.0,
-                color: if on { GOLD_HOT } else { GOLD },
+                color: GOLD,
             },
-            ..Default::default()
-        });
+            ..button::Style::default()
+        })
+        .into()
+}
 
-    let body = column![
-        text(title)
-            .size(16)
-            .color(if on { INK } else { FG }),
-        text(detail)
-            .size(12)
-            .color(if on {
-                Color::from_rgb8(0x5c, 0x43, 0x16)
-            } else {
-                MUTED
-            }),
-    ]
-    .spacing(2);
-
-    button(row![mark, body].spacing(12).align_y(Alignment::Center))
-        .on_press(Message::Answer(recorded))
+fn choice_row<'a>(label: &'a str, on: bool, message: Message) -> Element<'a, Message> {
+    button(text(label).size(16).color(if on { INK } else { GOLD }))
+        .on_press(message)
         .width(Length::Fill)
         .padding(10)
         .style(move |_, status| {
@@ -523,21 +582,11 @@ fn choice(
                 } else {
                     Color::from_rgba8(0, 0, 0, 0.28)
                 })),
-                text_color: if on { INK } else { FG },
+                text_color: if on { INK } else { GOLD },
                 border: Border {
                     radius: 14.0.into(),
-                    width: if on { 1.5 } else { 1.0 },
-                    color: if hot { GOLD_HOT } else { Color::from_rgba8(0xe8, 0xc3, 0x72, 0.45) },
-                },
-                shadow: Shadow {
-                    color: Color {
-                        r: 0.91,
-                        g: 0.76,
-                        b: 0.45,
-                        a: if on { 0.35 } else { 0.0 },
-                    },
-                    offset: Vector::new(0.0, 0.0),
-                    blur_radius: 16.0,
+                    width: 1.0,
+                    color: if hot { GOLD_HOT } else { GOLD },
                 },
                 ..button::Style::default()
             }
@@ -545,5 +594,840 @@ fn choice(
         .into()
 }
 
+#[derive(Clone)]
+struct OpenCard {
+    face: Face,
+    revealed: bool,
+    selected: Vec<String>,
+    persisted: bool,
+}
+
+#[derive(Clone)]
+struct Face {
+    deck: String,
+    guid: String,
+    ord: i64,
+    body: FaceBody,
+}
+
+#[derive(Clone)]
+enum FaceBody {
+    Sides { prompt: String, answer: String },
+    Choice {
+        prompt: String,
+        choices: Vec<(String, String)>,
+        correct: Vec<String>,
+    },
+}
+
+struct Study {
+    root: retention_popup::Root,
+    dir: PathBuf,
+    session: session::Session,
+    faces: Vec<Face>,
+    rows: Vec<retention_popup::MemoryRow>,
+    decks: Vec<String>,
+}
+
+enum Save {
+    Done,
+    MemoryOnly,
+    Held,
+}
+
+impl Study {
+    fn save_grade(&mut self, face: &Face, grade: retention_popup::Grade, now: i64) -> Save {
+        let previous = self
+            .rows
+            .iter()
+            .find(|row| row.guid == face.guid && row.ord == face.ord)
+            .map(memory_state);
+        let Ok(scheduled) = retention_popup::schedule(previous, 0, grade, now) else {
+            return Save::Held;
+        };
+        let Some(deck) = session::DeckName::new(face.deck.clone()) else {
+            return Save::Held;
+        };
+        let Some(guid) = session::Guid::new(face.guid.clone()) else {
+            return Save::Held;
+        };
+        let Some(ord) = session::CardOrd::new(face.ord) else {
+            return Save::Held;
+        };
+        let applied = self.session.answer(
+            &deck,
+            &guid,
+            ord,
+            session::Review {
+                grade,
+                now: session::Unix::new(now),
+                due_unix: session::Unix::new(scheduled.due_unix),
+            },
+        );
+        if !applied {
+            return Save::Held;
+        }
+        let row = retention_popup::MemoryRow {
+            guid: face.guid.clone(),
+            ord: face.ord,
+            stability: scheduled.memory.stability,
+            difficulty: scheduled.memory.difficulty,
+            stability_fast: scheduled.memory.stability_fast,
+            due_unix: scheduled.due_unix,
+        };
+        if retention_popup::write_memory_row(&self.root, &row).is_err() {
+            return Save::Held;
+        }
+        upsert_row(&mut self.rows, row);
+        if write_shown(self).is_err() {
+            return Save::MemoryOnly;
+        }
+        Save::Done
+    }
+}
+
+fn memory_state(row: &retention_popup::MemoryRow) -> fsrs::MemoryState {
+    fsrs::MemoryState {
+        stability: row.stability,
+        difficulty: row.difficulty,
+        stability_fast: row.stability_fast,
+    }
+}
+
+fn upsert_row(rows: &mut Vec<retention_popup::MemoryRow>, row: retention_popup::MemoryRow) {
+    if let Some(existing) = rows
+        .iter_mut()
+        .find(|stored| stored.guid == row.guid && stored.ord == row.ord)
+    {
+        *existing = row;
+    } else {
+        rows.push(row);
+    }
+}
+
+fn data_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_DATA_HOME").filter(|dir| !dir.is_empty()) {
+        return Some(PathBuf::from(dir).join("retention"));
+    }
+    std::env::var_os("HOME")
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| PathBuf::from(dir).join(".local/share/retention"))
+}
+
+fn choose_root(data_dir: &Path, requested: Option<&str>) -> Option<String> {
+    if let Some(id) = requested.filter(|id| !id.is_empty()) {
+        return Some(id.to_string());
+    }
+    let mut names = Vec::new();
+    let entries = std::fs::read_dir(data_dir.join("roots")).ok()?;
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if !kind.is_dir() {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        names.push(name);
+    }
+    if names.len() == 1 {
+        names.pop()
+    } else {
+        None
+    }
+}
+
+fn load_study(data_dir: &Path, root_id: &str) -> Option<Study> {
+    let root = retention_popup::open_root(data_dir, root_id).ok()?;
+    let dir = data_dir.join("roots").join(root_id);
+    let exported = retention_popup::export_text(&root).ok()?;
+    let import = retention_popup::accept_text(&exported).ok()?;
+    let rows = retention_popup::memory_rows(&root).ok()?;
+    let root_text = std::fs::read_to_string(dir.join("root.json")).ok()?;
+    let rules = parse_root(&root_text)?;
+    let deck_rules = read_decks(&dir.join("decks.json"))?;
+    let shown = read_shown(&dir.join("shown.json"))?;
+    let built = assemble(&import.notes, &rows, &rules, &deck_rules, &shown)?;
+    Some(Study {
+        root,
+        dir,
+        session: built.session,
+        faces: built.faces,
+        rows,
+        decks: built.decks,
+    })
+}
+
+struct RootRules {
+    start: i32,
+    end: i32,
+    gap_secs: i64,
+}
+
+fn parse_root(text: &str) -> Option<RootRules> {
+    let conn = Connection::open_in_memory().ok()?;
+    let (start, end, gap, gap_seconds): (Option<i64>, Option<i64>, Option<i64>, Option<i64>) =
+        conn.query_row(
+            "SELECT json_extract(?1, '$.start'), json_extract(?1, '$.end'), json_extract(?1, '$.gap'), json_extract(?1, '$.gap_seconds')",
+            params![text],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .ok()?;
+    Some(RootRules {
+        start: i32::try_from(start?).ok()?,
+        end: i32::try_from(end?).ok()?,
+        gap_secs: gap_seconds.unwrap_or(gap?.saturating_mul(60)),
+    })
+}
+
+struct DeckRule {
+    name: String,
+    delivery: DeckDelivery,
+}
+
+enum DeckDelivery {
+    Inherit,
+    Override {
+        start: i64,
+        end: i64,
+        gap_minutes: i64,
+    },
+}
+
+fn read_decks(path: &Path) -> Option<Vec<DeckRule>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_decks(&text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(Vec::new()),
+        Err(_) => None,
+    }
+}
+
+fn parse_decks(text: &str) -> Option<Vec<DeckRule>> {
+    let conn = Connection::open_in_memory().ok()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT
+                json_extract(value, '$.name'),
+                json_type(value, '$.delivery'),
+                json_extract(value, '$.delivery'),
+                json_extract(value, '$.delivery.start'),
+                json_extract(value, '$.delivery.end'),
+                json_extract(value, '$.delivery.gap')
+             FROM json_each(?1)",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map(params![text], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+            ))
+        })
+        .ok()?;
+    let mut decks = Vec::new();
+    for row in rows {
+        let (name, kind, raw, start, end, gap) = row.ok()?;
+        let name = name.filter(|name| !name.is_empty())?;
+        let delivery = match (kind.as_deref(), raw.as_deref(), start, end, gap) {
+            (Some("text"), Some("inherit"), _, _, _) => DeckDelivery::Inherit,
+            (Some("object"), _, Some(start), Some(end), Some(gap)) => DeckDelivery::Override {
+                start,
+                end,
+                gap_minutes: gap,
+            },
+            _ => return None,
+        };
+        decks.push(DeckRule { name, delivery });
+    }
+    Some(decks)
+}
+
+fn read_shown(path: &Path) -> Option<Vec<(String, i64)>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_shown(&text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(Vec::new()),
+        Err(_) => None,
+    }
+}
+
+fn parse_shown(text: &str) -> Option<Vec<(String, i64)>> {
+    let conn = Connection::open_in_memory().ok()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT json_extract(value, '$.deck'), json_extract(value, '$.next_allowed')
+             FROM json_each(?1)",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map(params![text], |row| {
+            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<i64>>(1)?))
+        })
+        .ok()?;
+    let mut shown = Vec::new();
+    for row in rows {
+        let (deck, next_allowed) = row.ok()?;
+        shown.push((deck.filter(|deck| !deck.is_empty())?, next_allowed?));
+    }
+    Some(shown)
+}
+
+fn write_shown(study: &Study) -> std::io::Result<()> {
+    let tmp = study.dir.join("shown.json.tmp");
+    std::fs::write(&tmp, render_shown(study))?;
+    std::fs::rename(&tmp, study.dir.join("shown.json"))
+}
+
+fn render_shown(study: &Study) -> String {
+    let mut parts = Vec::new();
+    for name in &study.decks {
+        let next = session::DeckName::new(name.clone())
+            .and_then(|deck| study.session.next_allowed(&deck))
+            .map(|unix| unix.get())
+            .unwrap_or(0);
+        parts.push(format!(
+            r#"{{"deck":{},"next_allowed":{next}}}"#,
+            json_string(name)
+        ));
+    }
+    format!("[{}]\n", parts.join(","))
+}
+
+fn json_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", u32::from(ch))),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+struct Assembled {
+    session: session::Session,
+    faces: Vec<Face>,
+    decks: Vec<String>,
+}
+
+fn assemble(
+    notes: &[retention_popup::Note],
+    rows: &[retention_popup::MemoryRow],
+    root: &RootRules,
+    deck_rules: &[DeckRule],
+    shown: &[(String, i64)],
+) -> Option<Assembled> {
+    let mut names = Vec::new();
+    for note in notes {
+        let name = note.deck.as_str();
+        if !names.iter().any(|have: &String| have == name) {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    let mut decks = Vec::new();
+    let mut faces = Vec::new();
+    for name in &names {
+        let (window, gap) = rules_for(name, root, deck_rules)?;
+        let mut cards = Vec::new();
+        for note in notes.iter().filter(|note| note.deck.as_str() == name) {
+            for (card, face) in faces_of(note, rows)? {
+                cards.push(card);
+                faces.push(face);
+            }
+        }
+        let next = shown
+            .iter()
+            .find(|(deck, _)| deck == name)
+            .map(|(_, unix)| *unix)
+            .unwrap_or(0);
+        decks.push(session::Deck::new(
+            session::DeckName::new(name.clone())?,
+            window,
+            gap,
+            session::Unix::new(next),
+            cards,
+        )?);
+    }
+    Some(Assembled {
+        session: session::Session::new(decks)?,
+        faces,
+        decks: names,
+    })
+}
+
+fn rules_for(
+    name: &str,
+    root: &RootRules,
+    decks: &[DeckRule],
+) -> Option<(session::Window, session::Gap)> {
+    let delivery = decks
+        .iter()
+        .find(|deck| deck.name == name)
+        .map(|deck| &deck.delivery);
+    match delivery {
+        Some(DeckDelivery::Override {
+            start,
+            end,
+            gap_minutes,
+        }) => {
+            let window = session::Window::new(i32::try_from(*start).ok()?, i32::try_from(*end).ok()?)?;
+            let gap = session::Gap::from_seconds(gap_minutes.saturating_mul(60))?;
+            Some((window, gap))
+        }
+        Some(DeckDelivery::Inherit) | None => {
+            let window = session::Window::new(root.start, root.end)?;
+            let gap = session::Gap::from_seconds(root.gap_secs)?;
+            Some((window, gap))
+        }
+    }
+}
+
+fn faces_of(
+    note: &retention_popup::Note,
+    rows: &[retention_popup::MemoryRow],
+) -> Option<Vec<(session::Card, Face)>> {
+    let guid = session::Guid::new(note.guid.as_str())?;
+    let deck = note.deck.as_str();
+    let guid_str = note.guid.as_str();
+    let mut out = Vec::new();
+    match &note.body {
+        retention_popup::NoteBody::Basic { front, back } => {
+            out.push(side(&guid, deck, guid_str, 0, front, back, rows)?);
+        }
+        retention_popup::NoteBody::Reversed { front, back } => {
+            out.push(side(&guid, deck, guid_str, 0, front, back, rows)?);
+            out.push(side(&guid, deck, guid_str, 1, back, front, rows)?);
+        }
+        retention_popup::NoteBody::Cloze { text } => {
+            let (prompt, answer) = cloze_sides(text);
+            out.push(side(&guid, deck, guid_str, 0, &prompt, &answer, rows)?);
+        }
+        retention_popup::NoteBody::Choice {
+            prompt,
+            choices,
+            correct,
+            explain: _,
+        } => {
+            let ord = session::CardOrd::new(0)?;
+            let card = session::Card::new(guid, ord, session::Unix::new(due_of(rows, guid_str, 0)));
+            out.push((
+                card,
+                Face {
+                    deck: deck.to_string(),
+                    guid: guid_str.to_string(),
+                    ord: 0,
+                    body: FaceBody::Choice {
+                        prompt: prompt.clone(),
+                        choices: choices
+                            .iter()
+                            .map(|choice| (choice.id.as_str().to_string(), choice.text.clone()))
+                            .collect(),
+                        correct: correct.iter().map(|id| id.as_str().to_string()).collect(),
+                    },
+                },
+            ));
+        }
+    }
+    Some(out)
+}
+
+fn side(
+    guid: &session::Guid,
+    deck: &str,
+    guid_str: &str,
+    ord: i64,
+    prompt: &str,
+    answer: &str,
+    rows: &[retention_popup::MemoryRow],
+) -> Option<(session::Card, Face)> {
+    let card = session::Card::new(
+        guid.clone(),
+        session::CardOrd::new(ord)?,
+        session::Unix::new(due_of(rows, guid_str, ord)),
+    );
+    Some((
+        card,
+        Face {
+            deck: deck.to_string(),
+            guid: guid_str.to_string(),
+            ord,
+            body: FaceBody::Sides {
+                prompt: prompt.to_string(),
+                answer: answer.to_string(),
+            },
+        },
+    ))
+}
+
+fn due_of(rows: &[retention_popup::MemoryRow], guid: &str, ord: i64) -> i64 {
+    rows.iter()
+        .find(|row| row.guid == guid && row.ord == ord)
+        .map(|row| row.due_unix)
+        .unwrap_or(0)
+}
+
+fn cloze_sides(text: &str) -> (String, String) {
+    let mut prompt = String::new();
+    let mut answer = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("{{c") {
+        prompt.push_str(&rest[..start]);
+        answer.push_str(&rest[..start]);
+        let after = &rest[start + 3..];
+        let Some(split_at) = after.find(|ch: char| !ch.is_ascii_digit()) else {
+            prompt.push_str(&rest[start..]);
+            answer.push_str(&rest[start..]);
+            break;
+        };
+        if split_at == 0 || !after[split_at..].starts_with("::") {
+            prompt.push_str("{{c");
+            answer.push_str("{{c");
+            rest = &rest[start + 3..];
+            continue;
+        }
+        let inner_at = split_at + 2;
+        let Some(end) = after[inner_at..].find("}}") else {
+            prompt.push_str(&rest[start..]);
+            answer.push_str(&rest[start..]);
+            break;
+        };
+        let inner = &after[inner_at..inner_at + end];
+        let revealed = inner.split_once("::").map(|(answer, _)| answer).unwrap_or(inner);
+        prompt.push_str("[...]");
+        answer.push_str(revealed);
+        rest = &after[inner_at + end + 2..];
+    }
+    prompt.push_str(rest);
+    answer.push_str(rest);
+    (prompt, answer)
+}
+
+fn startup_offset() -> i64 {
+    let Ok(output) = std::process::Command::new("date").arg("+%z").output() else {
+        return 0;
+    };
+    let Ok(text) = std::str::from_utf8(&output.stdout) else {
+        return 0;
+    };
+    parse_offset(text.trim()).unwrap_or(0)
+}
+
+fn parse_offset(text: &str) -> Option<i64> {
+    let sign = match text.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    if text.len() != 5 {
+        return None;
+    }
+    let hours: i64 = text[1..3].parse().ok()?;
+    let mins: i64 = text[3..5].parse().ok()?;
+    if mins >= 60 {
+        return None;
+    }
+    Some(sign * (hours * 3600 + mins * 60))
+}
+
+fn local_minute(unix: i64, offset: i64) -> Option<session::Minute> {
+    let minute = (unix + offset).rem_euclid(86_400) / 60;
+    session::Minute::new(i32::try_from(minute).ok()?)
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|dur| i64::try_from(dur.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
-mod popup_check;
+mod tests {
+    use super::*;
+
+    fn minute(value: i32) -> session::Minute {
+        session::Minute::new(value).expect("minute")
+    }
+
+    fn rules(text: &str) -> RootRules {
+        parse_root(text).expect("root")
+    }
+
+    fn basic_notes() -> Vec<retention_popup::Note> {
+        retention_popup::accept_text(include_str!("../fixtures/basic.txt"))
+            .expect("notes")
+            .notes
+    }
+
+    #[test]
+    fn offset_and_local_minute() {
+        assert_eq!(parse_offset("+0500"), Some(5 * 3600));
+        assert_eq!(parse_offset("-0530"), Some(-(5 * 3600 + 30 * 60)));
+        assert_eq!(
+            local_minute(0, 5 * 3600).map(session::Minute::get),
+            Some(300)
+        );
+        assert_eq!(
+            local_minute(0, -5 * 3600).map(session::Minute::get),
+            Some(19 * 60)
+        );
+    }
+
+    #[test]
+    fn cloze_hides_answer_and_hint() {
+        let (prompt, answer) = cloze_sides("The {{c1::capital::city}} is {{c2::Paris}}.");
+        assert_eq!(prompt, "The [...] is [...].");
+        assert_eq!(answer, "The capital is Paris.");
+    }
+
+    #[test]
+    fn gap_seconds_win_and_a_missing_row_is_due_at_zero() {
+        let notes = basic_notes();
+        let root = rules(r#"{"start":0,"end":1440,"gap":1,"gap_seconds":5}"#);
+        let built = assemble(&notes, &[], &root, &[], &[]).expect("session");
+        let now = session::Unix::new(1_700_000_000);
+        let picked = built.session.pick(now, minute(0)).expect("due");
+        assert_eq!(picked.due_unix.get(), 0);
+        assert_eq!(picked.ord.get(), 0);
+        let face = &built.faces[0];
+        match &face.body {
+            FaceBody::Sides { prompt, answer } => {
+                assert_eq!(prompt, "hablar");
+                assert_eq!(answer, "to speak");
+            }
+            FaceBody::Choice { .. } => panic!("basic face"),
+        }
+        let mut session = built.session;
+        let applied = session.answer(
+            &picked.deck,
+            &picked.guid,
+            picked.ord,
+            session::Review {
+                grade: retention_popup::Grade::Again,
+                now,
+                due_unix: session::Unix::new(1_700_000_003),
+            },
+        );
+        assert!(applied);
+        assert_eq!(
+            session.next_allowed(&picked.deck).map(session::Unix::get),
+            Some(1_700_000_005)
+        );
+        assert!(session.pick(session::Unix::new(1_700_000_004), minute(1439)).is_none());
+    }
+
+    #[test]
+    fn override_gap_is_minutes_and_inherit_uses_root_seconds() {
+        let notes = basic_notes();
+        let root = rules(r#"{"start":0,"end":1440,"gap":1,"gap_seconds":5}"#);
+        let inherited = assemble(&notes, &[], &root, &[], &[]).expect("inherit");
+        let deck = session::DeckName::new("Spanish::Verbs").unwrap();
+        let guid = session::Guid::new("abc123XYZ0").unwrap();
+        let ord = session::CardOrd::new(0).unwrap();
+        let now = session::Unix::new(50);
+        let mut session = inherited.session;
+        assert!(session.answer(
+            &deck,
+            &guid,
+            ord,
+            session::Review {
+                grade: retention_popup::Grade::Good,
+                now,
+                due_unix: session::Unix::new(80),
+            },
+        ));
+        assert_eq!(session.next_allowed(&deck).map(session::Unix::get), Some(55));
+
+        let decks = parse_decks(
+            r#"[{"name":"Spanish::Verbs","delivery":{"start":100,"end":200,"gap":2}}]"#,
+        )
+        .expect("decks");
+        let overridden = assemble(&notes, &[], &root, &decks, &[]).expect("override");
+        assert!(overridden.session.pick(now, minute(0)).is_none());
+        assert!(overridden.session.pick(now, minute(100)).is_some());
+        let mut session = overridden.session;
+        assert!(session.answer(
+            &deck,
+            &guid,
+            ord,
+            session::Review {
+                grade: retention_popup::Grade::Good,
+                now,
+                due_unix: session::Unix::new(80),
+            },
+        ));
+        assert_eq!(session.next_allowed(&deck).map(session::Unix::get), Some(170));
+    }
+
+    #[test]
+    fn reversed_cloze_and_choice_faces() {
+        let text = "\
+#separator:Tab
+#html:false
+#notetype:Basic (and reversed card)
+#deck:Words
+#columns:Front\tBack\tguid
+#guid column:3
+front\tback\trevGuid0001
+";
+        let notes = retention_popup::accept_text(text).unwrap().notes;
+        let root = rules(r#"{"start":0,"end":1440,"gap":1}"#);
+        assert_eq!(root.gap_secs, 60);
+        let built = assemble(&notes, &[], &root, &[], &[]).unwrap();
+        assert_eq!(built.faces.len(), 2);
+        match &built.faces[0].body {
+            FaceBody::Sides { prompt, answer } => {
+                assert_eq!(prompt, "front");
+                assert_eq!(answer, "back");
+            }
+            FaceBody::Choice { .. } => panic!("reversed"),
+        }
+        match &built.faces[1].body {
+            FaceBody::Sides { prompt, answer } => {
+                assert_eq!(prompt, "back");
+                assert_eq!(answer, "front");
+            }
+            FaceBody::Choice { .. } => panic!("reversed"),
+        }
+
+        let cloze = "\
+#separator:Tab
+#html:false
+#notetype:Cloze
+#deck:Words
+#columns:Text\tguid
+#guid column:2
+The {{c1::capital::city}}.\tclozeGuid01
+";
+        let notes = retention_popup::accept_text(cloze).unwrap().notes;
+        let built = assemble(&notes, &[], &root, &[], &[]).unwrap();
+        assert_eq!(built.faces.len(), 1);
+        assert_eq!(built.faces[0].ord, 0);
+        match &built.faces[0].body {
+            FaceBody::Sides { prompt, answer } => {
+                assert_eq!(prompt, "The [...].");
+                assert_eq!(answer, "The capital.");
+            }
+            FaceBody::Choice { .. } => panic!("cloze"),
+        }
+
+        let notes = retention_popup::accept_text(include_str!("../fixtures/choice.txt"))
+            .unwrap()
+            .notes;
+        let built = assemble(&notes, &[], &root, &[], &[]).unwrap();
+        assert_eq!(built.faces.len(), 1);
+        match &built.faces[0].body {
+            FaceBody::Choice {
+                prompt,
+                choices,
+                correct,
+            } => {
+                assert_eq!(prompt, "Which of these are FSRS grades?");
+                assert_eq!(choices.len(), 4);
+                assert_eq!(correct.as_slice(), ["again", "good"]);
+            }
+            FaceBody::Sides { .. } => panic!("choice"),
+        }
+    }
+
+    #[test]
+    fn shown_roundtrip_and_a_missing_deck_is_zero() {
+        let notes = basic_notes();
+        let root = rules(r#"{"start":0,"end":1440,"gap":1,"gap_seconds":5}"#);
+        let shown = parse_shown(r#"[{"deck":"Other","next_allowed":9}]"#).unwrap();
+        let built = assemble(&notes, &[], &root, &[], &shown).unwrap();
+        assert_eq!(
+            built
+                .session
+                .next_allowed(&session::DeckName::new("Spanish::Verbs").unwrap())
+                .map(session::Unix::get),
+            Some(0)
+        );
+        let dir = scratch();
+        let parsed = parse_shown(&render_shown(&Study {
+            root: retention_popup::open_root(&dir, "fixture").unwrap(),
+            dir: dir.clone(),
+            session: built.session,
+            faces: Vec::new(),
+            rows: Vec::new(),
+            decks: built.decks,
+        }))
+        .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(parsed, vec![("Spanish::Verbs".to_string(), 0)]);
+    }
+
+    #[test]
+    fn grade_persists_memory_and_the_gap() {
+        let dir = scratch();
+        let root = retention_popup::open_root(&dir, "fixture").unwrap();
+        retention_popup::import_text(&root, include_str!("../fixtures/basic.txt")).unwrap();
+        std::fs::write(
+            dir.join("roots/fixture/root.json"),
+            r#"{"start":0,"end":1440,"gap":1,"gap_seconds":5}"#,
+        )
+        .unwrap();
+        let mut study = load_study(&dir, "fixture").expect("study");
+        let now = 1_700_000_000;
+        let face = study.faces[0].clone();
+        let scheduled =
+            retention_popup::schedule(None, 0, retention_popup::Grade::Again, now).unwrap();
+        assert!(matches!(
+            study.save_grade(&face, retention_popup::Grade::Again, now),
+            Save::Done
+        ));
+        let rows = retention_popup::memory_rows(&study.root).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].guid, "abc123XYZ0");
+        assert_eq!(rows[0].ord, 0);
+        assert_eq!(rows[0].due_unix, scheduled.due_unix);
+        assert_eq!(rows[0].stability, scheduled.memory.stability);
+        assert_eq!(rows[0].difficulty, scheduled.memory.difficulty);
+        assert_eq!(rows[0].stability_fast, scheduled.memory.stability_fast);
+        let shown = parse_shown(&std::fs::read_to_string(study.dir.join("shown.json")).unwrap()).unwrap();
+        assert_eq!(shown, vec![("Spanish::Verbs".to_string(), now + 5)]);
+        let deck = session::DeckName::new("Spanish::Verbs").unwrap();
+        let guid = session::Guid::new("abc123XYZ0").unwrap();
+        let ord = session::CardOrd::new(0).unwrap();
+        assert!(study.session.due_unix(&deck, &guid, ord).unwrap().get() <= now + 4);
+        assert!(study.session.pick(session::Unix::new(now + 4), minute(0)).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn one_root_opens_and_two_roots_do_not() {
+        let dir = scratch();
+        std::fs::create_dir_all(dir.join("roots/only")).unwrap();
+        assert_eq!(choose_root(&dir, None).as_deref(), Some("only"));
+        std::fs::create_dir_all(dir.join("roots/other")).unwrap();
+        assert_eq!(choose_root(&dir, None), None);
+        assert_eq!(choose_root(&dir, Some("kept")).as_deref(), Some("kept"));
+        assert!(pid_busy(Some(4), 9, |_| true));
+        assert!(!pid_busy(Some(9), 9, |_| true));
+        assert!(!pid_busy(Some(4), 9, |_| false));
+        assert_eq!(parse_pid("42\n"), Some(42));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn scratch() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("retention-popup-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+}

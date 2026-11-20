@@ -6,8 +6,8 @@ This directory is the maintained source for verifying the user-facing behavior o
 
 - One Hyprland session. The harness refuses to start when `retention-controls` or `retention-card` is already mapped.
 - Launch with `.cursor/skills/verify-retention-popup/bin/verify-popup launch` from the repo root.
-- A fresh process starts at delay 5 seconds, corner top right, no quest card, and no answer. There is no seed data.
-- Run `.cursor/skills/verify-retention-popup/bin/verify-popup doctor` and require `controls 1` and the recorded evidence directory.
+- A fresh process starts with Top right selected. A due card may already be open. Do not press Show card. There is no countdown.
+- Run `.cursor/skills/verify-retention-popup/bin/verify-popup doctor` and require `controls 1` and the recorded evidence directory. `card` may be 0 or 1.
 - Never drive an instance that this verification run did not start.
 
 ## Driving conventions
@@ -16,7 +16,7 @@ This directory is the maintained source for verifying the user-facing behavior o
 - Click the visible button text. Do not click coordinates chosen by eye.
 - Treat every command as literal. Keep quoted labels and flags unchanged.
 - Run every pointer and screenshot action through `verify-popup`.
-- The quest card opens about N seconds after Show card, where N is the selected delay. Wait on the `retention-card` layer, not on a fixed sleep alone.
+- A due card opens on its own. Wait on the `retention-card` layer. Do not press Show card.
 - Cleanup removes the process this run started. It does not remove the evidence directory.
 
 ## Proof and skip reporting
@@ -41,7 +41,8 @@ Keep implementation details out of the map. Name only user paths, stable handles
 
 ## Features
 
-- [Show the card](./show-card.md) covers the countdown, the top-right quest card, and pressing Show card again.
+- [Due card](./due-card.md) covers the card that opens when it is due, the answer, and the gap.
+- [Show the card](./show-card.md) records that the countdown journey is gone.
 - [Pick a corner](./pick-corner.md) covers the four corner chips and the sentence on the quest card.
 - [Answer a path](./answer-path.md) covers the two quest choices and the locked-path line.
 - [Close the card](./close-card.md) covers the × control leaving the process up.

@@ -1,4 +1,4 @@
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Grade {
     Again,
     Hard,
@@ -27,12 +27,16 @@ pub fn schedule(
     };
     Ok(Scheduled {
         memory: item.memory,
-        due_unix: now_unix + (item.interval.round().max(1.0) as i64) * 86400,
+        due_unix: now_unix + due_secs(item.interval),
         log: fsrs::FSRSReview {
             rating,
             delta_t: elapsed_days as f32,
         },
     })
+}
+
+fn due_secs(interval_days: f32) -> i64 {
+    (interval_days as f64 * 86400.0).round().max(1.0) as i64
 }
 
 pub fn grade_choice(selected: &[&str], correct: &[&str]) -> Grade {
@@ -64,11 +68,18 @@ mod tests {
         ];
         for (grade, item, rating) in cases {
             let scheduled = schedule(None, elapsed_days, grade, now_unix).expect("schedule");
-            let due_unix = now_unix + (item.interval.round().max(1.0) as i64) * 86400;
+            let due_unix = now_unix + (item.interval as f64 * 86400.0).round().max(1.0) as i64;
             assert_eq!(scheduled.memory, item.memory);
             assert_eq!(scheduled.due_unix, due_unix);
             assert_eq!(scheduled.log.rating, rating);
             assert_eq!(scheduled.log.delta_t, 0.0);
+            if grade == Grade::Again {
+                let delta = scheduled.due_unix - now_unix;
+                assert!(
+                    (1..60).contains(&delta),
+                    "a new Again is due in seconds, got {delta}"
+                );
+            }
         }
     }
 

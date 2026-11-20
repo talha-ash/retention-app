@@ -231,10 +231,22 @@ def click_text(kind, phrase):
     png = Path(f"/tmp/verify-retention-popup-{kind}.png")
     words = ocr_words(png)
     box = phrase_box(words, phrase)
+    origin = (0, 0)
+    if box is None:
+        inset = 96
+        from PIL import Image
+
+        image = Image.open(png).convert("RGB")
+        if image.width > inset * 2 and image.height > inset * 2:
+            inner = image.crop((inset, inset, image.width - inset, image.height - inset))
+            inner_path = Path("/tmp/verify-retention-popup-inner.png")
+            inner.save(inner_path)
+            box = phrase_box(_tsv_words(inner_path, inset, inset, 1, 11), phrase)
     if box is None:
         raise SystemExit(
-            f"{phrase!r} not found on {kind}. OCR was: {ocr_text(png)!r}"
+            f"{phrase!r} not found on {kind}. OCR was: {ocr_text(png, inset=96)!r}"
         )
+    box = (box[0] + origin[0], box[1] + origin[1])
     img_w, img_h = png_size(png)
     gx = item["x"] + box[0] * item["w"] / img_w
     gy = item["y"] + box[1] * item["h"] / img_h
@@ -300,7 +312,7 @@ def launch():
         if proc.poll() is not None:
             cleanup()
             raise SystemExit(f"app exited before the control card appeared\n{log.read_text()[-2000:]}")
-        if len(named("controls")) == 1 and _label_visible("controls", "Show card"):
+        if len(named("controls")) == 1 and _label_visible("controls", "Top right"):
             print(f"ready evidence={evidence}")
             return
         time.sleep(0.25)
@@ -367,57 +379,7 @@ def _group_alive(pgid):
 
 
 def prove_show_card():
-    launch()
-    try:
-        evidence = evidence_dir()
-        (evidence / "doctor.txt").write_text(doctor())
-        (evidence / "layers-before.json").write_text(json.dumps(hypr(["layers", "-j"]), indent=2))
-        shot_surface("controls", evidence / "controls-before.png")
-        click_text("controls", "Show card")
-        time.sleep(0.4)
-        shot_surface("controls", evidence / "controls-armed.png")
-        armed = ocr_text(evidence / "controls-armed.png")
-        (evidence / "controls-armed.txt").write_text(armed + "\n")
-        armed_compact = "".join(ch for ch in armed.casefold() if ch.isalnum())
-        if "cardappearsin" not in armed_compact or "topright" not in armed_compact:
-            raise SystemExit(f"status after Show card was {armed!r}")
-        card = wait_surface("card", 12, True)
-        (evidence / "layers-card.json").write_text(json.dumps(hypr(["layers", "-j"]), indent=2))
-        shot_surface("card", evidence / "card.png")
-        card_text = ocr_text(evidence / "card.png", inset=96)
-        (evidence / "card.txt").write_text(card_text + "\n")
-        mon = monitor_for(card)
-        center_x = card["x"] + card["w"] / 2
-        center_y = card["y"] + card["h"] / 2
-        top_right = center_x > mon["x"] + mon["width"] / 2 and center_y < mon["y"] + mon["height"] / 2
-        controls_still = len(named("controls")) == 1
-        geometry = (
-            f"card {card['x']},{card['y']} {card['w']}x{card['h']} monitor {mon['name']}\n"
-            f"top_right {str(top_right).lower()}\n"
-            f"controls_still {str(controls_still).lower()}\n"
-        )
-        (evidence / "card-geometry.txt").write_text(geometry)
-        if not top_right or not controls_still:
-            raise SystemExit(geometry)
-        card_compact = "".join(ch for ch in card_text.casefold() if ch.isalnum())
-        if "slipped" not in card_compact:
-            raise SystemExit(f"card text was {card_text!r}")
-        click_text("controls", "Show card")
-        time.sleep(0.4)
-        wait_surface("card", 3, False)
-        shot_surface("controls", evidence / "controls-restarted.png")
-        restarted = ocr_text(evidence / "controls-restarted.png")
-        (evidence / "controls-restarted.txt").write_text(restarted + "\n")
-        if "cardappearsin" not in "".join(ch for ch in restarted.casefold() if ch.isalnum()):
-            raise SystemExit(f"status after the second Show card was {restarted!r}")
-        (evidence / "result.txt").write_text("pass show-card\n")
-        print(f"pass show-card evidence={evidence}")
-    except BaseException:
-        if load_state() is not None:
-            (evidence_dir() / "result.txt").write_text("fail show-card\n")
-        raise
-    finally:
-        cleanup()
+    raise SystemExit("the countdown journey is gone")
 
 
 def main():
