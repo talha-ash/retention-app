@@ -669,7 +669,24 @@ fn note_cells(note: &Note, columns: &[&str]) -> Vec<String> {
         .collect()
 }
 
+fn escape_field(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn field_value(body: &NoteBody, name: &str) -> String {
+    let raw = field_raw(body, name);
+    escape_field(&raw)
+}
+
+fn field_raw(body: &NoteBody, name: &str) -> String {
     match (body, name) {
         (NoteBody::Basic { front, .. } | NoteBody::Reversed { front, .. }, "Front") => {
             front.clone()
@@ -719,6 +736,23 @@ mod tests {
         assert_eq!(from_apkg.notes, fixture.notes);
         assert_eq!(zip_names(&bytes), vec!["collection.anki21".to_string()]);
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn markdown_newlines_stay_on_one_row() {
+        let dir = temp_dir();
+        let root = super::open_root(&dir, "basic").unwrap();
+        let text = "#separator:Tab\n#html:false\n#notetype:Basic\n#deck:Words\n#columns:Front\tBack\tguid\n#guid column:3\nhola\t# Greetings\\n\\n- hi\tabc123XYZ0\n";
+        super::import_text(&root, text).unwrap();
+        let exported = super::export_text(&root).unwrap();
+        assert!(exported.contains("\\n"));
+        assert!(!exported.contains("\n- hi"));
+        let notes = accept_text(&exported).unwrap();
+        match &notes.notes[0].body {
+            NoteBody::Basic { back, .. } => assert_eq!(back, "# Greetings\n\n- hi"),
+            other => panic!("{other:?}"),
+        }
         let _ = fs::remove_dir_all(dir);
     }
 

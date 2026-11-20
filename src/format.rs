@@ -221,6 +221,27 @@ fn column_index(value: &str, name: &'static str) -> Result<usize, FormatError> {
     Ok(parsed - 1)
 }
 
+fn field_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 fn split_row(line: &str, separator: char) -> Vec<&str> {
     line.split(separator).collect()
 }
@@ -248,7 +269,7 @@ fn text_fields(headers: &Headers, kind: Kind, values: &[&str]) -> HashMap<String
                 continue;
             }
             let value = values.get(index).copied().unwrap_or("");
-            map.insert(name.clone(), value.to_string());
+            map.insert(name.clone(), field_text(value));
         }
         return map;
     }
@@ -261,10 +282,10 @@ fn text_fields(headers: &Headers, kind: Kind, values: &[&str]) -> HashMap<String
             kept.push(*value);
         }
         if let Some(front) = kept.first() {
-            map.insert("Front".to_string(), (*front).to_string());
+            map.insert("Front".to_string(), field_text(front));
         }
         if let Some(back) = kept.get(1) {
-            map.insert("Back".to_string(), (*back).to_string());
+            map.insert("Back".to_string(), field_text(back));
         }
     }
     map
