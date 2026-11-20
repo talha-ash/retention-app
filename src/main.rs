@@ -1,6 +1,7 @@
 //! Control card, and a due card in the corner you picked.
 
 mod library;
+mod markdown;
 mod session;
 mod smoke;
 
@@ -1045,8 +1046,7 @@ impl App {
             FaceBody::Sides { prompt, answer } => {
                 if open.revealed {
                     column![
-                        prompt_text(prompt),
-                        prompt_text(answer),
+                        reading(&[prompt, answer]),
                         row![
                             gold_button("Again", Message::Grade(retention_popup::Grade::Again)),
                             gold_button("Hard", Message::Grade(retention_popup::Grade::Hard)),
@@ -1056,32 +1056,69 @@ impl App {
                         .spacing(8),
                     ]
                     .spacing(12)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
                     .into()
                 } else {
                     column![
-                        prompt_text(prompt),
+                        reading(&[prompt]),
                         gold_button("Show answer", Message::ShowAnswer),
                     ]
                     .spacing(12)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
                     .into()
                 }
             }
             FaceBody::Choice {
                 prompt, choices, ..
             } => {
-                let mut col = column![prompt_text(prompt)].spacing(12);
+                let mut body = Column::new().spacing(12).width(Length::Fill);
+                for block in markdown::blocks(prompt) {
+                    body = body.push(block_line(&block));
+                }
                 for (id, label) in choices {
                     let on = open.selected.iter().any(|picked| picked == id);
-                    col = col.push(choice_row(label, on, Message::Toggle(id.clone())));
+                    body = body.push(choice_row(label, on, Message::Toggle(id.clone())));
                 }
-                col.push(gold_button("Continue", Message::Continue)).into()
+                column![
+                    scrollable(body).width(Length::Fill).height(Length::Fill),
+                    gold_button("Continue", Message::Continue),
+                ]
+                .spacing(12)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
             }
         }
     }
 }
 
-fn prompt_text<'a>(value: &'a str) -> Element<'a, Message> {
-    text(value).size(22).color(FG).into()
+fn reading(parts: &[&str]) -> Element<'static, Message> {
+    let mut col = Column::new().spacing(10).width(Length::Fill);
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            col = col.push(Space::new().height(Length::Fixed(8.0)));
+        }
+        for block in markdown::blocks(part) {
+            col = col.push(block_line(&block));
+        }
+    }
+    scrollable(col)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+fn block_line(block: &markdown::Block) -> Element<'static, Message> {
+    let (value, size) = match block {
+        markdown::Block::Heading { level: 1, text } => (text.clone(), 26),
+        markdown::Block::Heading { level: 2, text } => (text.clone(), 22),
+        markdown::Block::Heading { text, .. } => (text.clone(), 20),
+        markdown::Block::Paragraph(text) => (text.clone(), 22),
+        markdown::Block::Item(text) => (format!("• {text}"), 22),
+    };
+    text(value).size(size).color(FG).width(Length::Fill).into()
 }
 
 fn night_fill() -> Linear {
