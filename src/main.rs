@@ -1,5 +1,6 @@
 //! Control card, and a due card in the corner you picked.
 
+mod library;
 mod session;
 mod smoke;
 
@@ -49,7 +50,7 @@ fn main() -> iced_layershell::Result {
                 anchor: Anchor::empty(),
                 layer: Layer::Top,
                 exclusive_zone: 0,
-                size: Some((420, 520)),
+                size: Some((460, 720)),
                 margin: (0, 0, 0, 0),
                 keyboard_interactivity: KeyboardInteractivity::OnDemand,
                 start_mode: StartMode::Active,
@@ -119,6 +120,14 @@ struct App {
     corner: Corner,
     offset: i64,
     study: Option<Study>,
+    data: Option<PathBuf>,
+    catalog: library::Catalog,
+    selected: Option<String>,
+    draft_open: bool,
+    draft_start: i64,
+    draft_end: i64,
+    draft_gap: i64,
+    status: String,
     popup_id: Option<iced::window::Id>,
     open: Option<OpenCard>,
     opened_at: Option<Instant>,
@@ -164,19 +173,50 @@ enum Message {
     Grade(retention_popup::Grade),
     Glow,
     Quit,
+    OpenRoot(String),
+    NewRoot,
+    SelectDeck(String),
+    NewDeck,
+    SetInherit,
+    OpenDraft,
+    StartUp,
+    StartDown,
+    EndUp,
+    EndDown,
+    GapUp,
+    GapDown,
+    Save,
+    Import(String),
+    Export,
 }
 
 impl App {
     fn new() -> Self {
         let requested = std::env::var("RETENTION_ROOT").ok();
-        let study = data_dir().and_then(|dir| {
-            choose_root(&dir, requested.as_deref().filter(|id| !id.is_empty()))
-                .and_then(|id| load_study(&dir, &id))
+        let data = data_dir();
+        let chosen = data.as_ref().and_then(|dir| {
+            choose_root(dir, requested.as_deref().filter(|id| !id.is_empty()))
         });
+        let study = data
+            .as_ref()
+            .zip(chosen.as_ref())
+            .and_then(|(dir, id)| load_study(dir, id));
+        let mut catalog = library::Catalog::load(data.as_deref().unwrap_or(Path::new("")));
+        if let Some(id) = &chosen {
+            let _ = catalog.open(id);
+        }
         Self {
             corner: Corner::TopRight,
             offset: startup_offset(),
             study,
+            data,
+            catalog,
+            selected: None,
+            draft_open: false,
+            draft_start: 540,
+            draft_end: 1080,
+            draft_gap: 45,
+            status: String::new(),
             popup_id: None,
             open: None,
             opened_at: None,
@@ -230,8 +270,122 @@ impl App {
                 Task::none()
             }
             Message::Quit => iced::exit(),
+            Message::OpenRoot(id) => {
+                let same = self.catalog.open_id() == Some(id.as_str());
+                let opened = self.catalog.open(&id);
+                if self.finish(opened) && !same {
+                    self.selected = None;
+                    self.draft_open = false;
+                }
+                Task::none()
+            }
+            Message::NewRoot => {
+                let created = self.catalog.create_root().map(|_| ());
+                if self.finish(created) {
+                    self.selected = None;
+                    self.draft_open = false;
+                }
+                Task::none()
+            }
+            Message::SelectDeck(name) => {
+                self.selected = Some(name);
+                self.draft_open = false;
+                Task::none()
+            }
+            Message::NewDeck => {
+                let created = self.catalog.create_deck().map(|_| ());
+                let _ = self.finish(created);
+                Task::none()
+            }
+            Message::SetInherit => {
+                let Some(deck) = self.selected.clone() else {
+                    return Task::none();
+                };
+                let saved = self.catalog.set_inherit(&deck);
+                if self.finish(saved) {
+                    self.draft_open = false;
+                }
+                Task::none()
+            }
+            Message::OpenDraft => {
+                self.draft_open = true;
+                Task::none()
+            }
+            Message::StartUp => {
+                self.draft_start = slide(self.draft_start, 30, 0, 1440);
+                Task::none()
+            }
+            Message::StartDown => {
+                self.draft_start = slide(self.draft_start, -30, 0, 1440);
+                Task::none()
+            }
+            Message::EndUp => {
+                self.draft_end = slide(self.draft_end, 30, 0, 1440);
+                Task::none()
+            }
+            Message::EndDown => {
+                self.draft_end = slide(self.draft_end, -30, 0, 1440);
+                Task::none()
+            }
+            Message::GapUp => {
+                self.draft_gap = slide(self.draft_gap, 5, 1, 1440);
+                Task::none()
+            }
+            Message::GapDown => {
+                self.draft_gap = slide(self.draft_gap, -5, 1, 1440);
+                Task::none()
+            }
+            Message::Save => {
+                let Some(deck) = self.selected.clone() else {
+                    return Task::none();
+                };
+                let saved = self.catalog.set_override(
+                    &deck,
+                    self.draft_start,
+                    self.draft_end,
+                    self.draft_gap,
+                );
+                if self.finish(saved) {
+                    self.draft_open = false;
+                }
+                Task::none()
+            }
+            Message::Import(name) => {
+                let imported = self.catalog.import_inbox(&name);
+                let _ = self.finish(imported);
+                Task::none()
+            }
+            Message::Export => {
+                let exported = self.catalog.export_notes().map(|_| ());
+                let _ = self.finish(exported);
+                Task::none()
+            }
             _ => Task::none(),
         }
+    }
+
+    fn finish(&mut self, result: Result<(), library::Error>) -> bool {
+        match result {
+            Ok(()) => {
+                self.status.clear();
+                self.reload_study();
+                true
+            }
+            Err(err) => {
+                self.status = catalog_status(err).to_string();
+                false
+            }
+        }
+    }
+
+    fn reload_study(&mut self) {
+        let Some(dir) = self.data.clone() else {
+            return;
+        };
+        let Some(id) = self.catalog.open_id().map(str::to_string) else {
+            return;
+        };
+        self.study = load_study(&dir, &id);
     }
 
     fn choice_grade(&self) -> Option<retention_popup::Grade> {
@@ -363,9 +517,14 @@ impl App {
     }
 
     fn controls(&self) -> Element<'_, Message> {
-        column![
-            text("Retention").size(28).color(FG),
-            text("Corner").size(13).color(MUTED),
+        let mut col = Column::new().spacing(12);
+        col = col.push(text("Retention").size(28).color(FG));
+        for id in self.catalog.root_ids() {
+            col = col.push(action(id.clone(), Message::OpenRoot(id.clone())));
+        }
+        col = col.push(action("New root", Message::NewRoot));
+        col = col.push(text("Corner").size(13).color(MUTED));
+        col = col.push(
             row![
                 chip(
                     Corner::TopLeft.label(),
@@ -379,6 +538,8 @@ impl App {
                 ),
             ]
             .spacing(8),
+        );
+        col = col.push(
             row![
                 chip(
                     Corner::BottomLeft.label(),
@@ -392,6 +553,66 @@ impl App {
                 ),
             ]
             .spacing(8),
+        );
+        for deck in self.catalog.decks() {
+            let kind = match deck.delivery {
+                library::DeliveryChoice::Inherit => "inherit",
+                library::DeliveryChoice::Override { .. } => "override",
+            };
+            let label = format!("{} {kind}", deck.name);
+            col = col.push(action(label, Message::SelectDeck(deck.name.clone())));
+        }
+        if self.catalog.open_id().is_some() {
+            col = col.push(action("New deck", Message::NewDeck));
+        }
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|name| self.catalog.decks().iter().any(|deck| &deck.name == name))
+        {
+            if self.draft_open {
+                col = col.push(draft_row(
+                    format!("start {}", self.draft_start),
+                    "Start up",
+                    Message::StartUp,
+                    "Start down",
+                    Message::StartDown,
+                ));
+                col = col.push(draft_row(
+                    format!("end {}", self.draft_end),
+                    "End up",
+                    Message::EndUp,
+                    "End down",
+                    Message::EndDown,
+                ));
+                col = col.push(draft_row(
+                    format!("gap {}", self.draft_gap),
+                    "Gap up",
+                    Message::GapUp,
+                    "Gap down",
+                    Message::GapDown,
+                ));
+                col = col.push(action("Save", Message::Save));
+            } else {
+                col = col.push(
+                    row![
+                        action("Inherit", Message::SetInherit),
+                        action("Override", Message::OpenDraft),
+                    ]
+                    .spacing(8),
+                );
+            }
+        }
+        if self.catalog.open_id().is_some() {
+            for name in self.catalog.inbox() {
+                col = col.push(action(name.clone(), Message::Import(name)));
+            }
+            col = col.push(action("Export", Message::Export));
+        }
+        if !self.status.is_empty() {
+            col = col.push(text(&self.status).size(14).color(FG));
+        }
+        col = col.push(
             button(text("Quit").size(14).color(MUTED))
                 .on_press(Message::Quit)
                 .style(|_, _| button::Style {
@@ -404,9 +625,8 @@ impl App {
                     },
                     ..button::Style::default()
                 }),
-        ]
-        .spacing(12)
-        .into()
+        );
+        col.into()
     }
 
     fn study_card(&self) -> Element<'_, Message> {
@@ -480,6 +700,60 @@ fn card(inner: Element<'_, Message>) -> Element<'_, Message> {
             ..Default::default()
         })
         .into()
+}
+
+fn action(label: impl Into<String>, message: Message) -> Element<'static, Message> {
+    button(text(label.into()).size(14).color(FG))
+        .on_press(message)
+        .padding([5, 10])
+        .style(|_, status| {
+            let fill = if status == button::Status::Hovered {
+                Color::from_rgb8(0x2f, 0x35, 0x4d)
+            } else {
+                BG
+            };
+            button::Style {
+                background: Some(Background::Color(fill)),
+                text_color: FG,
+                border: Border {
+                    radius: 10.0.into(),
+                    width: 1.0,
+                    color: LINE,
+                },
+                ..button::Style::default()
+            }
+        })
+        .into()
+}
+
+fn draft_row(
+    label: String,
+    up: &'static str,
+    up_message: Message,
+    down: &'static str,
+    down_message: Message,
+) -> Element<'static, Message> {
+    row![
+        text(label).size(14).color(FG),
+        action(up, up_message),
+        action(down, down_message),
+    ]
+    .spacing(8)
+    .into()
+}
+
+fn slide(value: i64, step: i64, low: i64, high: i64) -> i64 {
+    value.saturating_add(step).clamp(low, high)
+}
+
+fn catalog_status(err: library::Error) -> &'static str {
+    match err {
+        library::Error::BadWindow => "Bad window",
+        library::Error::MissingRoot => "Missing root",
+        library::Error::MissingDeck => "Missing deck",
+        library::Error::BadFileName => "Bad file name",
+        library::Error::Failed => "Failed",
+    }
 }
 
 fn chip(label: &str, on: bool, message: Message) -> Element<'_, Message> {
