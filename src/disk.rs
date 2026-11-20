@@ -127,6 +127,20 @@ pub fn memory_rows(root: &Root) -> Result<Vec<MemoryRow>, DiskError> {
     read_memory(&root.dir)
 }
 
+pub fn map_notes(root: &Root, mut change: impl FnMut(&mut Note)) -> Result<(), DiskError> {
+    let mut notes = load_notes(&root.dir)?;
+    for note in &mut notes {
+        change(note);
+    }
+    store_notes(&root.dir, &notes)
+}
+
+pub fn retain_notes(root: &Root, mut keep: impl FnMut(&Note) -> bool) -> Result<(), DiskError> {
+    let mut notes = load_notes(&root.dir)?;
+    notes.retain(|note| keep(note));
+    store_notes(&root.dir, &notes)
+}
+
 pub fn write_memory_row(root: &Root, row: &MemoryRow) -> Result<(), DiskError> {
     let mut rows = read_memory(&root.dir)?;
     if let Some(existing) = rows

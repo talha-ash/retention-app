@@ -7,8 +7,8 @@ mod model;
 
 pub use delivery::{DeckDelivery, Delivery, DueCard, Gap, Show, Window, per_deck_shows};
 pub use disk::{
-    DiskError, MemoryRow, Root, export_apkg, export_text, import_apkg, import_text, memory_rows,
-    open_root, write_memory_row,
+    DiskError, MemoryRow, Root, export_apkg, export_text, import_apkg, import_text, map_notes,
+    memory_rows, open_root, retain_notes, write_memory_row,
 };
 pub use format::{FormatError, accept_apkg, accept_path, accept_text};
 pub use memory::{Grade, Scheduled, grade_choice, schedule};

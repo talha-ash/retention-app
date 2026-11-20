@@ -16,6 +16,14 @@ pub struct DeckRow {
     pub delivery: DeliveryChoice,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootRules {
+    pub start: i64,
+    pub end: i64,
+    pub gap: i64,
+    pub gap_seconds: Option<i64>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     BadWindow,
@@ -23,6 +31,7 @@ pub enum Error {
     MissingDeck,
     BadFileName,
     Failed,
+    Exists,
 }
 
 pub struct Catalog {
@@ -171,6 +180,113 @@ impl Catalog {
         Ok(())
     }
 
+    pub fn rename_root(&mut self, from: &str, to: &str) -> Result<(), Error> {
+        self.root_dir(from)?;
+        let to = clean_id(to)?;
+        if self.roots.iter().any(|have| have == &to) {
+            return Err(Error::Exists);
+        }
+        let roots = self.data_dir.join("roots");
+        std::fs::rename(roots.join(from), roots.join(&to)).map_err(|_| Error::Failed)?;
+        self.roots = list_roots(&self.data_dir);
+        if self.open.as_deref() == Some(from) {
+            self.open = Some(to);
+        }
+        Ok(())
+    }
+
+    pub fn delete_root(&mut self, id: &str) -> Result<(), Error> {
+        let dir = self.root_dir(id)?;
+        std::fs::remove_dir_all(dir).map_err(|_| Error::Failed)?;
+        self.roots = list_roots(&self.data_dir);
+        if self.open.as_deref() == Some(id) {
+            self.open = None;
+            self.decks.clear();
+        }
+        Ok(())
+    }
+
+    pub fn root_rules(&self) -> Result<RootRules, Error> {
+        let id = self.open.as_deref().ok_or(Error::MissingRoot)?;
+        read_root_rules(&self.data_dir.join("roots").join(id).join("root.json"))
+    }
+
+    pub fn set_root_rules(&mut self, start: i64, end: i64, gap: i64) -> Result<(), Error> {
+        let id = self.open.clone().ok_or(Error::MissingRoot)?;
+        let path = self.data_dir.join("roots").join(&id).join("root.json");
+        let mut rules = read_root_rules(&path).unwrap_or(RootRules {
+            start: 540,
+            end: 1080,
+            gap: 45,
+            gap_seconds: None,
+        });
+        checked_window(start, end, gap)?;
+        rules.start = start;
+        rules.end = end;
+        rules.gap = gap;
+        atomic_write(
+            path.parent().ok_or(Error::Failed)?,
+            "root.json",
+            render_root(&rules).as_bytes(),
+        )
+    }
+
+    pub fn rename_deck(&mut self, from: &str, to: &str) -> Result<(), Error> {
+        let to = clean_name(to)?;
+        if self.decks.iter().any(|row| row.name == to) {
+            return Err(Error::Exists);
+        }
+        if !self.decks.iter().any(|row| row.name == from) {
+            return Err(Error::MissingDeck);
+        }
+        let id = self.open.clone().ok_or(Error::MissingRoot)?;
+        let root = retention_popup::open_root(&self.data_dir, &id).map_err(|_| Error::Failed)?;
+        retention_popup::map_notes(&root, |note| {
+            if note.deck.as_str() == from {
+                if let Some(name) = retention_popup::DeckName::new(to.clone()) {
+                    note.deck = name;
+                }
+            }
+        })
+        .map_err(|_| Error::Failed)?;
+        let mut decks = self.decks.clone();
+        let row = decks
+            .iter_mut()
+            .find(|row| row.name == from)
+            .ok_or(Error::MissingDeck)?;
+        row.name = to;
+        self.write_decks(&decks)?;
+        self.decks = decks;
+        Ok(())
+    }
+
+    pub fn delete_deck(&mut self, name: &str) -> Result<(), Error> {
+        if !self.decks.iter().any(|row| row.name == name) {
+            return Err(Error::MissingDeck);
+        }
+        let id = self.open.clone().ok_or(Error::MissingRoot)?;
+        let root = retention_popup::open_root(&self.data_dir, &id).map_err(|_| Error::Failed)?;
+        let target = name.to_string();
+        retention_popup::retain_notes(&root, |note| note.deck.as_str() != target)
+            .map_err(|_| Error::Failed)?;
+        let decks: Vec<DeckRow> = self
+            .decks
+            .iter()
+            .filter(|row| row.name != name)
+            .cloned()
+            .collect();
+        self.write_decks(&decks)?;
+        self.decks = decks;
+        Ok(())
+    }
+
+    fn root_dir(&self, id: &str) -> Result<PathBuf, Error> {
+        if !self.roots.iter().any(|have| have == id) {
+            return Err(Error::MissingRoot);
+        }
+        Ok(self.data_dir.join("roots").join(id))
+    }
+
     pub fn export_notes(&mut self) -> Result<PathBuf, Error> {
         let id = self.open.clone().ok_or(Error::MissingRoot)?;
         let root = retention_popup::open_root(&self.data_dir, &id).map_err(|_| Error::Failed)?;
@@ -185,6 +301,70 @@ impl Catalog {
         let id = self.open.as_deref().ok_or(Error::MissingRoot)?;
         let dir = self.data_dir.join("roots").join(id);
         atomic_write(&dir, "decks.json", render_decks(decks).as_bytes())
+    }
+}
+
+fn clean_id(value: &str) -> Result<String, Error> {
+    let value = value.trim();
+    if value.is_empty() || value.contains('/') || value.contains("..") {
+        Err(Error::BadFileName)
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn clean_name(value: &str) -> Result<String, Error> {
+    let value = value.trim();
+    if value.is_empty() || value.contains('\n') || value.contains('\t') {
+        Err(Error::BadFileName)
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn checked_window(start: i64, end: i64, gap: i64) -> Result<(), Error> {
+    let (start_i, end_i, gap_i) = (
+        i32::try_from(start).map_err(|_| Error::BadWindow)?,
+        i32::try_from(end).map_err(|_| Error::BadWindow)?,
+        i32::try_from(gap).map_err(|_| Error::BadWindow)?,
+    );
+    if retention_popup::Window::new(start_i, end_i).is_none()
+        || retention_popup::Gap::new(gap_i).is_none()
+    {
+        Err(Error::BadWindow)
+    } else {
+        Ok(())
+    }
+}
+
+fn read_root_rules(path: &Path) -> Result<RootRules, Error> {
+    let text = std::fs::read_to_string(path).map_err(|_| Error::Failed)?;
+    let conn = Connection::open_in_memory().map_err(|_| Error::Failed)?;
+    let (start, end, gap, gap_seconds): (Option<i64>, Option<i64>, Option<i64>, Option<i64>) =
+        conn.query_row(
+            "SELECT json_extract(?1, '$.start'), json_extract(?1, '$.end'), json_extract(?1, '$.gap'), json_extract(?1, '$.gap_seconds')",
+            params![text],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|_| Error::Failed)?;
+    Ok(RootRules {
+        start: start.ok_or(Error::Failed)?,
+        end: end.ok_or(Error::Failed)?,
+        gap: gap.ok_or(Error::Failed)?,
+        gap_seconds,
+    })
+}
+
+fn render_root(rules: &RootRules) -> String {
+    match rules.gap_seconds {
+        Some(seconds) => format!(
+            r#"{{"start":{},"end":{},"gap":{},"gap_seconds":{seconds}}}"#,
+            rules.start, rules.end, rules.gap
+        ),
+        None => format!(
+            r#"{{"start":{},"end":{},"gap":{}}}"#,
+            rules.start, rules.end, rules.gap
+        ),
     }
 }
 
@@ -459,6 +639,70 @@ mod tests {
         assert_eq!(catalog.create_root().unwrap(), "r2");
         assert!(catalog.root_ids().iter().any(|id| id == "r1"));
         assert!(catalog.root_ids().iter().any(|id| id == "r2"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rename_and_delete_root() {
+        let dir = temp_dir();
+        let mut catalog = Catalog::load(&dir);
+        catalog.create_root().unwrap();
+        catalog.rename_root("r1", "notes").unwrap();
+        assert_eq!(catalog.open_id(), Some("notes"));
+        assert!(dir.join("roots/notes").is_dir());
+        assert!(!dir.join("roots/r1").exists());
+        catalog.set_root_rules(0, 1440, 10).unwrap();
+        assert_eq!(
+            catalog.root_rules().unwrap(),
+            RootRules {
+                start: 0,
+                end: 1440,
+                gap: 10,
+                gap_seconds: None,
+            }
+        );
+        assert_eq!(
+            catalog.set_root_rules(10, 10, 10),
+            Err(Error::BadWindow)
+        );
+        assert_eq!(catalog.root_rules().unwrap().start, 0);
+        catalog.delete_root("notes").unwrap();
+        assert!(catalog.root_ids().is_empty());
+        assert!(catalog.open_id().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rename_and_delete_deck_moves_notes() {
+        let dir = temp_dir();
+        let inbox = dir.join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::write(inbox.join("basic.txt"), include_str!("../fixtures/basic.txt")).unwrap();
+        let mut catalog = Catalog::load(&dir);
+        catalog.create_root().unwrap();
+        catalog.import_inbox("basic.txt").unwrap();
+        catalog
+            .set_override("Spanish::Verbs", 600, 900, 20)
+            .unwrap();
+        catalog.rename_deck("Spanish::Verbs", "Speech").unwrap();
+        assert_eq!(
+            catalog.decks()[0].delivery,
+            DeliveryChoice::Override {
+                start: 600,
+                end: 900,
+                gap: 20,
+            }
+        );
+        let text = std::fs::read_to_string(catalog.export_notes().unwrap()).unwrap();
+        assert!(text.contains("abc123XYZ0"));
+        assert!(text.contains("Speech"));
+        assert!(!text.contains("Spanish::Verbs"));
+        assert_eq!(catalog.decks().len(), 1);
+        assert_eq!(catalog.decks()[0].name, "Speech");
+        catalog.delete_deck("Speech").unwrap();
+        let text = std::fs::read_to_string(catalog.export_notes().unwrap()).unwrap();
+        assert!(!text.contains("abc123XYZ0"));
+        assert!(catalog.decks().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

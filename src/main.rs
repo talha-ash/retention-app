@@ -9,7 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use iced::gradient::Linear;
 use iced::widget::shader::Shader;
-use iced::widget::{button, column, container, row, text, Column, Stack};
+use iced::widget::{
+    button, column, container, row, scrollable, text, text_input, Column, Space, Stack,
+};
 use iced::{
     Background, Border, Color, Element, Length, Radians, Shadow, Subscription, Task, Theme, Vector,
 };
@@ -22,7 +24,6 @@ use iced_layershell::to_layer_message;
 use rusqlite::{Connection, params};
 
 const BG: Color = Color::from_rgb8(0x1a, 0x1b, 0x26);
-const CARD: Color = Color::from_rgb8(0x24, 0x28, 0x3b);
 const FG: Color = Color::from_rgb8(0xc0, 0xca, 0xf5);
 const MUTED: Color = Color::from_rgb8(0x56, 0x5f, 0x89);
 const ACCENT: Color = Color::from_rgb8(0x7a, 0xa2, 0xf7);
@@ -30,6 +31,27 @@ const LINE: Color = Color::from_rgb8(0x41, 0x48, 0x68);
 const GOLD: Color = Color::from_rgb8(0xe8, 0xc3, 0x72);
 const GOLD_HOT: Color = Color::from_rgb8(0xff, 0xe1, 0xa8);
 const INK: Color = Color::from_rgb8(0x1a, 0x12, 0x08);
+
+fn boot_stream() -> impl iced::futures::Stream<Item = Message> + Send + 'static {
+    iced::stream::channel(1, async |mut sender| {
+        let _ = sender.try_send(Message::Boot);
+        std::future::pending::<()>().await;
+    })
+}
+
+fn listen(
+    event: iced::Event,
+    _: iced::event::Status,
+    id: iced::window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Window(iced::window::Event::Opened { .. }) => Some(Message::Opened(id)),
+        iced::Event::Window(iced::window::Event::CloseRequested) => {
+            Some(Message::CloseRequested(id))
+        }
+        _ => None,
+    }
+}
 
 const POPUP_SIZE: (u32, u32) = (652, 552);
 const MARGIN: i32 = 16;
@@ -47,13 +69,13 @@ fn main() -> iced_layershell::Result {
         })
         .settings(Settings {
             layer_settings: LayerShellSettings {
-                anchor: Anchor::empty(),
+                anchor: Anchor::Top | Anchor::Left,
                 layer: Layer::Top,
                 exclusive_zone: 0,
-                size: Some((460, 720)),
+                size: None,
                 margin: (0, 0, 0, 0),
-                keyboard_interactivity: KeyboardInteractivity::OnDemand,
-                start_mode: StartMode::Active,
+                keyboard_interactivity: KeyboardInteractivity::None,
+                start_mode: StartMode::Background,
                 events_transparent: false,
             },
             ..Default::default()
@@ -128,6 +150,11 @@ struct App {
     draft_end: i64,
     draft_gap: i64,
     status: String,
+    page: Page,
+    name_draft: String,
+    pending: Option<Pending>,
+    shell_id: Option<iced::window::Id>,
+    desktop_id: Option<iced::window::Id>,
     popup_id: Option<iced::window::Id>,
     open: Option<OpenCard>,
     opened_at: Option<Instant>,
@@ -162,6 +189,21 @@ impl Corner {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Roots,
+    Root,
+    Decks,
+    Deck,
+    Import,
+    Settings,
+}
+
+enum Pending {
+    Root(String),
+    Deck(String),
+}
+
 #[to_layer_message(multi)]
 #[derive(Debug, Clone)]
 enum Message {
@@ -188,6 +230,17 @@ enum Message {
     Save,
     Import(String),
     Export,
+    Go(Page),
+    NameChanged(String),
+    SavePage,
+    EditRoot(String),
+    EditDeck(String),
+    AskDelete,
+    ConfirmDelete,
+    CancelDelete,
+    Opened(iced::window::Id),
+    CloseRequested(iced::window::Id),
+    Boot,
 }
 
 impl App {
@@ -217,6 +270,11 @@ impl App {
             draft_end: 1080,
             draft_gap: 45,
             status: String::new(),
+            page: Page::Roots,
+            name_draft: String::new(),
+            pending: None,
+            shell_id: None,
+            desktop_id: None,
             popup_id: None,
             open: None,
             opened_at: None,
@@ -229,7 +287,12 @@ impl App {
         let smoke = state.popup_id.is_some().then(|| {
             iced::time::every(Duration::from_millis(32)).map(|_| Message::Glow)
         });
-        Subscription::batch(std::iter::once(tick).chain(smoke))
+        Subscription::batch(
+            std::iter::once(tick)
+                .chain(smoke)
+                .chain(std::iter::once(iced::event::listen_with(listen)))
+                .chain(std::iter::once(Subscription::run(boot_stream))),
+        )
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -273,9 +336,13 @@ impl App {
             Message::OpenRoot(id) => {
                 let same = self.catalog.open_id() == Some(id.as_str());
                 let opened = self.catalog.open(&id);
-                if self.finish(opened) && !same {
-                    self.selected = None;
-                    self.draft_open = false;
+                if self.finish(opened) {
+                    if !same {
+                        self.selected = None;
+                        self.draft_open = false;
+                    }
+                    self.page = Page::Decks;
+                    self.pending = None;
                 }
                 Task::none()
             }
@@ -284,6 +351,8 @@ impl App {
                 if self.finish(created) {
                     self.selected = None;
                     self.draft_open = false;
+                    self.page = Page::Decks;
+                    self.pending = None;
                 }
                 Task::none()
             }
@@ -298,13 +367,7 @@ impl App {
                 Task::none()
             }
             Message::SetInherit => {
-                let Some(deck) = self.selected.clone() else {
-                    return Task::none();
-                };
-                let saved = self.catalog.set_inherit(&deck);
-                if self.finish(saved) {
-                    self.draft_open = false;
-                }
+                self.draft_open = false;
                 Task::none()
             }
             Message::OpenDraft => {
@@ -360,6 +423,38 @@ impl App {
                 let _ = self.finish(exported);
                 Task::none()
             }
+            Message::Go(page) => self.go(page),
+            Message::NameChanged(value) => {
+                self.name_draft = value;
+                Task::none()
+            }
+            Message::SavePage => self.save_page(),
+            Message::EditRoot(id) => self.edit_root(id),
+            Message::EditDeck(name) => self.edit_deck(name),
+            Message::AskDelete => {
+                self.pending = match self.page {
+                    Page::Root => self.catalog.open_id().map(|id| Pending::Root(id.to_string())),
+                    Page::Deck => self.selected.clone().map(Pending::Deck),
+                    _ => None,
+                };
+                Task::none()
+            }
+            Message::CancelDelete => {
+                self.pending = None;
+                Task::none()
+            }
+            Message::ConfirmDelete => self.confirm_delete(),
+            Message::Opened(id) => self.opened(id),
+            Message::Boot => self.open_desktop(),
+            Message::CloseRequested(id) => {
+                if self.desktop_id == Some(id) {
+                    iced::exit()
+                } else if self.popup_id == Some(id) {
+                    self.dismiss()
+                } else {
+                    Task::none()
+                }
+            }
             _ => Task::none(),
         }
     }
@@ -383,6 +478,7 @@ impl App {
             return;
         };
         let Some(id) = self.catalog.open_id().map(str::to_string) else {
+            self.study = None;
             return;
         };
         self.study = load_study(&dir, &id);
@@ -512,19 +608,359 @@ impl App {
             .height(Length::Fill)
             .into()
         } else {
-            card(self.controls())
+            self.desktop()
         }
     }
 
-    fn controls(&self) -> Element<'_, Message> {
-        let mut col = Column::new().spacing(12);
-        col = col.push(text("Retention").size(28).color(FG));
-        for id in self.catalog.root_ids() {
-            col = col.push(action(id.clone(), Message::OpenRoot(id.clone())));
+    fn go(&mut self, page: Page) -> Task<Message> {
+        let needs_root = matches!(page, Page::Decks | Page::Deck | Page::Import);
+        if needs_root && self.catalog.open_id().is_none() {
+            self.status = "Open a root".to_string();
+            self.page = Page::Roots;
+            return Task::none();
         }
-        col = col.push(action("New root", Message::NewRoot));
-        col = col.push(text("Corner").size(13).color(MUTED));
-        col = col.push(
+        self.page = page;
+        self.pending = None;
+        self.status.clear();
+        Task::none()
+    }
+
+    fn edit_root(&mut self, id: String) -> Task<Message> {
+        let opened = self.catalog.open(&id);
+        if self.finish(opened) {
+            self.name_draft = id;
+            if let Ok(rules) = self.catalog.root_rules() {
+                self.draft_start = rules.start;
+                self.draft_end = rules.end;
+                self.draft_gap = rules.gap;
+            }
+            self.page = Page::Root;
+            self.pending = None;
+            self.selected = None;
+        }
+        Task::none()
+    }
+
+    fn edit_deck(&mut self, name: String) -> Task<Message> {
+        let row = self
+            .catalog
+            .decks()
+            .iter()
+            .find(|deck| deck.name == name)
+            .cloned();
+        let Some(row) = row else {
+            return Task::none();
+        };
+        if let library::DeliveryChoice::Override { start, end, gap } = row.delivery {
+            self.draft_start = start;
+            self.draft_end = end;
+            self.draft_gap = gap;
+            self.draft_open = true;
+        } else {
+            self.draft_open = false;
+        }
+        self.selected = Some(name.clone());
+        self.name_draft = name;
+        self.page = Page::Deck;
+        self.pending = None;
+        self.status.clear();
+        Task::none()
+    }
+
+    fn save_page(&mut self) -> Task<Message> {
+        match self.page {
+            Page::Root => {
+                let Some(id) = self.catalog.open_id().map(str::to_string) else {
+                    return Task::none();
+                };
+                let renamed = if self.name_draft.trim() != id {
+                    self.catalog.rename_root(&id, &self.name_draft)
+                } else {
+                    Ok(())
+                };
+                if !self.finish(renamed) {
+                    return Task::none();
+                }
+                let saved =
+                    self.catalog
+                        .set_root_rules(self.draft_start, self.draft_end, self.draft_gap);
+                let _ = self.finish(saved);
+            }
+            Page::Deck => {
+                let Some(name) = self.selected.clone() else {
+                    return Task::none();
+                };
+                let renamed = if self.name_draft.trim() != name {
+                    self.catalog.rename_deck(&name, &self.name_draft)
+                } else {
+                    Ok(())
+                };
+                if !self.finish(renamed) {
+                    return Task::none();
+                }
+                let current = if self.name_draft.trim() != name {
+                    self.name_draft.trim().to_string()
+                } else {
+                    name
+                };
+                self.selected = Some(current.clone());
+                let saved = if self.draft_open {
+                    self.catalog.set_override(
+                        &current,
+                        self.draft_start,
+                        self.draft_end,
+                        self.draft_gap,
+                    )
+                } else {
+                    self.catalog.set_inherit(&current)
+                };
+                let _ = self.finish(saved);
+            }
+            _ => {}
+        }
+        Task::none()
+    }
+
+    fn confirm_delete(&mut self) -> Task<Message> {
+        let Some(pending) = self.pending.take() else {
+            return Task::none();
+        };
+        match pending {
+            Pending::Root(id) => {
+                let removed = self.catalog.delete_root(&id);
+                if self.finish(removed) && self.catalog.open_id().is_none() {
+                    self.page = Page::Roots;
+                    self.selected = None;
+                    return self.dismiss();
+                }
+            }
+            Pending::Deck(name) => {
+                let removed = self.catalog.delete_deck(&name);
+                if self.finish(removed) {
+                    self.selected = None;
+                    self.page = Page::Decks;
+                }
+            }
+        }
+        Task::none()
+    }
+
+    fn opened(&mut self, id: iced::window::Id) -> Task<Message> {
+        if self.popup_id == Some(id) {
+            return Task::none();
+        }
+        if self.desktop_id == Some(id) {
+            let Some(shell) = self.shell_id else {
+                return Task::none();
+            };
+            return Task::done(Message::RemoveWindow(shell));
+        }
+        if self.shell_id.is_none() {
+            self.shell_id = Some(id);
+        }
+        self.open_desktop()
+    }
+
+    fn open_desktop(&mut self) -> Task<Message> {
+        if self.desktop_id.is_some() {
+            return Task::none();
+        }
+        let (desktop, task) =
+            Message::base_window_open(iced_layershell::actions::IcedXdgWindowSettings {
+                size: Some((960, 680)),
+                client_side_decorations: false,
+            });
+        self.desktop_id = Some(desktop);
+        task
+    }
+
+    fn desktop(&self) -> Element<'_, Message> {
+        row![self.rail(), self.page_body()]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn rail(&self) -> Element<'_, Message> {
+        container(
+            column![
+                text("Retention").size(20).color(GOLD),
+                self.nav("Roots", Page::Roots),
+                self.nav("Decks", Page::Decks),
+                self.nav("Import", Page::Import),
+                self.nav("Settings", Page::Settings),
+                Space::new().height(Length::Fill),
+                wide("Quit", Message::Quit),
+            ]
+            .spacing(10)
+            .height(Length::Fill)
+            .width(Length::Fill),
+        )
+        .width(Length::Fixed(196.0))
+        .height(Length::Fill)
+        .padding(18)
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgb8(0x12, 0x14, 0x1e))),
+            text_color: Some(FG),
+            ..Default::default()
+        })
+        .into()
+    }
+
+    fn nav(&self, label: &'static str, page: Page) -> Element<'_, Message> {
+        let on = match page {
+            Page::Roots => matches!(self.page, Page::Roots | Page::Root),
+            Page::Decks => matches!(self.page, Page::Decks | Page::Deck),
+            other => self.page == other,
+        };
+        marked(label, on, Message::Go(page))
+    }
+
+    fn page_body(&self) -> Element<'_, Message> {
+        let mut body = Column::new().spacing(12).width(Length::Fill);
+        body = body.push(text(self.page_title()).size(26).color(FG));
+        if !self.status.is_empty() {
+            body = body.push(text(&self.status).size(14).color(GOLD));
+        }
+        body = body.push(self.page_content());
+        container(scrollable(body))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(28)
+            .style(|_| container::Style {
+                background: Some(Background::Color(BG)),
+                text_color: Some(FG),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn page_title(&self) -> String {
+        match self.page {
+            Page::Roots => "Roots".to_string(),
+            Page::Root => "Edit root".to_string(),
+            Page::Decks => self
+                .catalog
+                .open_id()
+                .map(|id| format!("Decks in {id}"))
+                .unwrap_or_else(|| "Decks".to_string()),
+            Page::Deck => "Edit deck".to_string(),
+            Page::Import => "Import".to_string(),
+            Page::Settings => "Settings".to_string(),
+        }
+    }
+
+    fn page_content(&self) -> Element<'_, Message> {
+        match self.page {
+            Page::Roots => self.roots_page(),
+            Page::Root => self.root_page(),
+            Page::Decks => self.decks_page(),
+            Page::Deck => self.deck_page(),
+            Page::Import => self.import_page(),
+            Page::Settings => self.settings_page(),
+        }
+    }
+
+    fn roots_page(&self) -> Element<'_, Message> {
+        let mut list = Column::new().spacing(8).width(Length::Fill);
+        if self.catalog.root_ids().is_empty() {
+            list = list.push(text("No root").size(14).color(MUTED));
+        }
+        for id in self.catalog.root_ids() {
+            let on = self.catalog.open_id() == Some(id.as_str());
+            list = list.push(
+                row![
+                    marked(id.clone(), on, Message::OpenRoot(id.clone())),
+                    action(format!("Edit {id}"), Message::EditRoot(id.clone())),
+                ]
+                .spacing(8),
+            );
+        }
+        list = list.push(wide("New root", Message::NewRoot));
+        list.into()
+    }
+
+    fn root_page(&self) -> Element<'_, Message> {
+        column![
+            text_input("Name", &self.name_draft)
+                .on_input(Message::NameChanged)
+                .padding(10)
+                .size(16)
+                .width(Length::Fill),
+            self.schedule_editor(),
+            wide("Save", Message::SavePage),
+            self.delete_row(),
+        ]
+        .spacing(12)
+        .width(Length::Fill)
+        .into()
+    }
+
+    fn decks_page(&self) -> Element<'_, Message> {
+        let mut list = Column::new().spacing(8).width(Length::Fill);
+        if self.catalog.open_id().is_none() {
+            return text("Open a root").size(14).color(MUTED).into();
+        }
+        if self.catalog.decks().is_empty() {
+            list = list.push(text("No decks").size(14).color(MUTED));
+        }
+        for deck in self.catalog.decks() {
+            let kind = match deck.delivery {
+                library::DeliveryChoice::Inherit => "inherit",
+                library::DeliveryChoice::Override { .. } => "override",
+            };
+            list = list.push(marked(
+                format!("{} {kind}", deck.name),
+                false,
+                Message::EditDeck(deck.name.clone()),
+            ));
+        }
+        list = list.push(wide("New deck", Message::NewDeck));
+        list.into()
+    }
+
+    fn deck_page(&self) -> Element<'_, Message> {
+        let mut body = column![
+            text_input("Name", &self.name_draft)
+                .on_input(Message::NameChanged)
+                .padding(10)
+                .size(16)
+                .width(Length::Fill),
+            row![
+                marked("Inherit", !self.draft_open, Message::SetInherit),
+                marked("Override", self.draft_open, Message::OpenDraft),
+            ]
+            .spacing(8),
+        ]
+        .spacing(12)
+        .width(Length::Fill);
+        if self.draft_open {
+            body = body.push(self.schedule_editor());
+        }
+        body.push(wide("Save", Message::SavePage))
+            .push(self.delete_row())
+            .into()
+    }
+
+    fn import_page(&self) -> Element<'_, Message> {
+        if self.catalog.open_id().is_none() {
+            return text("Open a root").size(14).color(MUTED).into();
+        }
+        let mut list = Column::new().spacing(8).width(Length::Fill);
+        let inbox = self.catalog.inbox();
+        if inbox.is_empty() {
+            list = list.push(text("No file").size(14).color(MUTED));
+        }
+        for name in inbox {
+            list = list.push(wide(name.clone(), Message::Import(name)));
+        }
+        list = list.push(wide("Export", Message::Export));
+        list.into()
+    }
+
+    fn settings_page(&self) -> Element<'_, Message> {
+        column![
+            text("Corner").size(13).color(MUTED),
             row![
                 chip(
                     Corner::TopLeft.label(),
@@ -538,8 +974,6 @@ impl App {
                 ),
             ]
             .spacing(8),
-        );
-        col = col.push(
             row![
                 chip(
                     Corner::BottomLeft.label(),
@@ -553,80 +987,54 @@ impl App {
                 ),
             ]
             .spacing(8),
-        );
-        for deck in self.catalog.decks() {
-            let kind = match deck.delivery {
-                library::DeliveryChoice::Inherit => "inherit",
-                library::DeliveryChoice::Override { .. } => "override",
-            };
-            let label = format!("{} {kind}", deck.name);
-            col = col.push(action(label, Message::SelectDeck(deck.name.clone())));
+        ]
+        .spacing(10)
+        .into()
+    }
+
+    fn schedule_editor(&self) -> Element<'_, Message> {
+        column![
+            draft_row(
+                format!("start {}", self.draft_start),
+                "Start up",
+                Message::StartUp,
+                "Start down",
+                Message::StartDown,
+            ),
+            draft_row(
+                format!("end {}", self.draft_end),
+                "End up",
+                Message::EndUp,
+                "End down",
+                Message::EndDown,
+            ),
+            draft_row(
+                format!("gap {}", self.draft_gap),
+                "Gap up",
+                Message::GapUp,
+                "Gap down",
+                Message::GapDown,
+            ),
+        ]
+        .spacing(8)
+        .into()
+    }
+
+    fn delete_row(&self) -> Element<'_, Message> {
+        let asking = match (&self.pending, self.page) {
+            (Some(Pending::Root(_)), Page::Root) | (Some(Pending::Deck(_)), Page::Deck) => true,
+            _ => false,
+        };
+        if asking {
+            row![
+                wide("Confirm delete", Message::ConfirmDelete),
+                wide("Cancel", Message::CancelDelete),
+            ]
+            .spacing(8)
+            .into()
+        } else {
+            wide("Delete", Message::AskDelete)
         }
-        if self.catalog.open_id().is_some() {
-            col = col.push(action("New deck", Message::NewDeck));
-        }
-        if self
-            .selected
-            .as_ref()
-            .is_some_and(|name| self.catalog.decks().iter().any(|deck| &deck.name == name))
-        {
-            if self.draft_open {
-                col = col.push(draft_row(
-                    format!("start {}", self.draft_start),
-                    "Start up",
-                    Message::StartUp,
-                    "Start down",
-                    Message::StartDown,
-                ));
-                col = col.push(draft_row(
-                    format!("end {}", self.draft_end),
-                    "End up",
-                    Message::EndUp,
-                    "End down",
-                    Message::EndDown,
-                ));
-                col = col.push(draft_row(
-                    format!("gap {}", self.draft_gap),
-                    "Gap up",
-                    Message::GapUp,
-                    "Gap down",
-                    Message::GapDown,
-                ));
-                col = col.push(action("Save", Message::Save));
-            } else {
-                col = col.push(
-                    row![
-                        action("Inherit", Message::SetInherit),
-                        action("Override", Message::OpenDraft),
-                    ]
-                    .spacing(8),
-                );
-            }
-        }
-        if self.catalog.open_id().is_some() {
-            for name in self.catalog.inbox() {
-                col = col.push(action(name.clone(), Message::Import(name)));
-            }
-            col = col.push(action("Export", Message::Export));
-        }
-        if !self.status.is_empty() {
-            col = col.push(text(&self.status).size(14).color(FG));
-        }
-        col = col.push(
-            button(text("Quit").size(14).color(MUTED))
-                .on_press(Message::Quit)
-                .style(|_, _| button::Style {
-                    background: Some(Background::Color(Color::from_rgba8(0, 0, 0, 0.0))),
-                    text_color: MUTED,
-                    border: Border {
-                        radius: 10.0.into(),
-                        width: 1.0,
-                        color: LINE,
-                    },
-                    ..button::Style::default()
-                }),
-        );
-        col.into()
     }
 
     fn study_card(&self) -> Element<'_, Message> {
@@ -676,53 +1084,56 @@ fn prompt_text<'a>(value: &'a str) -> Element<'a, Message> {
     text(value).size(22).color(FG).into()
 }
 
-fn card(inner: Element<'_, Message>) -> Element<'_, Message> {
-    container(inner)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(22)
-        .style(|_| container::Style {
-            background: Some(Background::Color(CARD)),
-            text_color: Some(FG),
-            border: Border {
-                color: LINE,
-                width: 1.0,
-                radius: 18.0.into(),
-            },
-            shadow: Shadow {
-                color: Color {
-                    a: 0.45,
-                    ..Color::BLACK
-                },
-                offset: Vector::new(0.0, 12.0),
-                blur_radius: 28.0,
-            },
-            ..Default::default()
-        })
-        .into()
+fn night_fill() -> Linear {
+    Linear::new(Radians(1.15))
+        .add_stop(0.0, Color::from_rgb8(0x3a, 0x22, 0x58))
+        .add_stop(0.45, Color::from_rgb8(0x1c, 0x16, 0x32))
+        .add_stop(1.0, Color::from_rgb8(0x10, 0x12, 0x1e))
+}
+
+fn gold_style(on: bool, status: button::Status) -> button::Style {
+    let hot = on || status == button::Status::Hovered;
+    button::Style {
+        background: Some(Background::Color(if on {
+            GOLD
+        } else if hot {
+            Color::from_rgba8(0xe8, 0xc3, 0x72, 0.16)
+        } else {
+            Color::from_rgba8(0, 0, 0, 0.28)
+        })),
+        text_color: if on { INK } else { GOLD },
+        border: Border {
+            radius: 12.0.into(),
+            width: 1.0,
+            color: if hot { GOLD_HOT } else { GOLD },
+        },
+        ..button::Style::default()
+    }
 }
 
 fn action(label: impl Into<String>, message: Message) -> Element<'static, Message> {
-    button(text(label.into()).size(14).color(FG))
+    button(text(label.into()).size(14).color(GOLD))
         .on_press(message)
-        .padding([5, 10])
-        .style(|_, status| {
-            let fill = if status == button::Status::Hovered {
-                Color::from_rgb8(0x2f, 0x35, 0x4d)
-            } else {
-                BG
-            };
-            button::Style {
-                background: Some(Background::Color(fill)),
-                text_color: FG,
-                border: Border {
-                    radius: 10.0.into(),
-                    width: 1.0,
-                    color: LINE,
-                },
-                ..button::Style::default()
-            }
-        })
+        .padding([8, 12])
+        .style(|_, status| gold_style(false, status))
+        .into()
+}
+
+fn wide(label: impl Into<String>, message: Message) -> Element<'static, Message> {
+    button(text(label.into()).size(14).color(GOLD))
+        .on_press(message)
+        .width(Length::Fill)
+        .padding([8, 12])
+        .style(|_, status| gold_style(false, status))
+        .into()
+}
+
+fn marked(label: impl Into<String>, on: bool, message: Message) -> Element<'static, Message> {
+    button(text(label.into()).size(14).color(if on { INK } else { GOLD }))
+        .on_press(message)
+        .width(Length::Fill)
+        .padding([8, 12])
+        .style(move |_, status| gold_style(on, status))
         .into()
 }
 
@@ -753,6 +1164,7 @@ fn catalog_status(err: library::Error) -> &'static str {
         library::Error::MissingDeck => "Missing deck",
         library::Error::BadFileName => "Bad file name",
         library::Error::Failed => "Failed",
+        library::Error::Exists => "Already exists",
     }
 }
 
@@ -782,10 +1194,7 @@ fn chip(label: &str, on: bool, message: Message) -> Element<'_, Message> {
 }
 
 fn quest_card(inner: Element<'_, Message>) -> Element<'_, Message> {
-    let fill = Linear::new(Radians(1.15))
-        .add_stop(0.0, Color::from_rgb8(0x3a, 0x22, 0x58))
-        .add_stop(0.45, Color::from_rgb8(0x1c, 0x16, 0x32))
-        .add_stop(1.0, Color::from_rgb8(0x10, 0x12, 0x1e));
+    let fill = night_fill();
 
     container(inner)
         .width(Length::Fill)
