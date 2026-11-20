@@ -1111,14 +1111,51 @@ fn reading(parts: &[&str]) -> Element<'static, Message> {
 }
 
 fn block_line(block: &markdown::Block) -> Element<'static, Message> {
-    let (value, size) = match block {
-        markdown::Block::Heading { level: 1, text } => (text.clone(), 26),
-        markdown::Block::Heading { level: 2, text } => (text.clone(), 22),
-        markdown::Block::Heading { text, .. } => (text.clone(), 20),
-        markdown::Block::Paragraph(text) => (text.clone(), 22),
-        markdown::Block::Item(text) => (format!("• {text}"), 22),
+    let (body, size, bullet) = match block {
+        markdown::Block::Heading { level: 1, text } => (text.clone(), 26.0, false),
+        markdown::Block::Heading { level: 2, text } => (text.clone(), 22.0, false),
+        markdown::Block::Heading { text, .. } => (text.clone(), 20.0, false),
+        markdown::Block::Paragraph(text) => (text.clone(), 22.0, false),
+        markdown::Block::Item(text) => (text.clone(), 22.0, true),
     };
-    text(value).size(size).color(FG).width(Length::Fill).into()
+    let mut spans = Vec::new();
+    if bullet {
+        spans.push(mark_span("• ", size, iced::Font::default()));
+    }
+    for mark in markdown::marks(&body) {
+        let (value, font) = match mark {
+            markdown::Mark::Plain(value) => (value, iced::Font::default()),
+            markdown::Mark::Strong(value) => (
+                value,
+                iced::Font {
+                    weight: iced::font::Weight::Bold,
+                    ..iced::Font::default()
+                },
+            ),
+            markdown::Mark::Em(value) => (
+                value,
+                iced::Font {
+                    style: iced::font::Style::Italic,
+                    ..iced::Font::default()
+                },
+            ),
+        };
+        spans.push(mark_span(value, size, font));
+    }
+    if spans.is_empty() {
+        spans.push(mark_span("", size, iced::Font::default()));
+    }
+    iced::widget::text::Rich::with_spans(spans)
+        .size(size)
+        .width(Length::Fill)
+        .into()
+}
+
+fn mark_span(value: impl Into<String>, size: f32, font: iced::Font) -> iced::widget::text::Span<'static, (), iced::Font> {
+    iced::widget::text::Span::new(value.into())
+        .size(size)
+        .font(font)
+        .color(FG)
 }
 
 fn night_fill() -> Linear {
