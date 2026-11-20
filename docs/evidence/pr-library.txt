@@ -1,0 +1,21 @@
+pr-library import timing
+
+Repeat of the pr-disk import probe. Recorded against docs/evidence/pr-disk.txt.
+
+The release roundtrip example imported 1000 Basic notes into an empty root. The clock is Instant inside the process, around import_text. Process start and the cargo build are outside that clock. Each of the three runs used a fresh XDG_DATA_HOME. The command was roundtrip --cards 1000.
+
+The machine had 12 cores. Load average before the runs was 1.78, 2.45, 2.45. perf and strace are not installed, so this record does not name a function inside the import.
+
+Every run exited 0 and printed 1000 and 1000. The first count is notes added. The second is the requested count. Run 1 left 1000 rows in the notes table of collection.anki21.
+
+Durations in seconds, in run order.
+
+0.012295
+0.010228
+0.010112
+
+Median 0.010228 seconds. Range 0.010112 to 0.012295 seconds.
+
+The pr-disk median is 0.013482 seconds. Twice that median is 0.026964 seconds. This median is under that line, so the perf rule does not fail. The two ranges do not overlap. An extra run, not one of the three, printed 0.013994 seconds, which sits inside the pr-disk range. The lower three-run median is not a speedup. This probe still calls import_text. The control card does not.
+
+On that extra run, user time was 0.013008 seconds and system time was 0.002992 seconds. The inner print was 0.013994 seconds, and the notes table held 1000 rows. User time is most of the inner duration, so the import is waiting on the CPU in this process. Block I/O counters stayed at 0, so the run did not spend the clock on a disk stall.
