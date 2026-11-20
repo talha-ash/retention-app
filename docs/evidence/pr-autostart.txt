@@ -1,0 +1,21 @@
+pr-autostart process
+
+This is not a fresh login. Hyprland was already running. `o.launch_on_start` runs when the session starts, so the line in `~/.config/hypr/autostart.lua` has not fired yet. The process below was started by hand with `retention-popup`. The next login is the run that line starts.
+
+`hyprctl reload` printed `ok`. `hyprctl configerrors` was empty.
+
+`~/.local/bin/retention-popup` points at `target/release/retention-popup`. The process had no `XDG_DATA_HOME` and no `RETENTION_ROOT`. `~/.local/share/retention/roots` does not exist, so no card is due.
+
+One process was running, pid 163256. A second start exited 0, and the count stayed 1.
+
+A first launch in this shell inherited a test `XDG_DATA_HOME` and opened a fixture card. That process was stopped. It is not in the samples below.
+
+Samples are `VmRSS` from `/proc/163256/status`, 30 seconds apart. Record only.
+
+11:41:16  138680 kB  retention-controls
+11:41:46  138736 kB  retention-controls
+11:42:16  138776 kB  retention-controls
+
+Median 138736 kB. Range 138680 kB to 138776 kB.
+
+No `retention-card` layer was present. The resident set is the control card and the process. The corner card was not up.
