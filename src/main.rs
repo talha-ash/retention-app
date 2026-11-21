@@ -1,9 +1,11 @@
 //! Control card, and a due card in the corner you picked.
 
+mod desk;
 mod library;
 mod markdown;
 mod session;
 mod smoke;
+mod tray;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -11,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use iced::gradient::Linear;
 use iced::widget::shader::Shader;
 use iced::widget::{
-    button, column, container, row, scrollable, text, text_input, Column, Space, Stack,
+    Column, Space, Stack, button, column, container, row, scrollable, text, text_input,
 };
 use iced::{
     Background, Border, Color, Element, Length, Radians, Shadow, Subscription, Task, Theme, Vector,
@@ -40,11 +42,7 @@ fn boot_stream() -> impl iced::futures::Stream<Item = Message> + Send + 'static 
     })
 }
 
-fn listen(
-    event: iced::Event,
-    _: iced::event::Status,
-    id: iced::window::Id,
-) -> Option<Message> {
+fn listen(event: iced::Event, _: iced::event::Status, id: iced::window::Id) -> Option<Message> {
     match event {
         iced::Event::Window(iced::window::Event::Opened { .. }) => Some(Message::Opened(id)),
         iced::Event::Window(iced::window::Event::CloseRequested) => {
@@ -155,8 +153,9 @@ struct App {
     name_draft: String,
     pending: Option<Pending>,
     shell_id: Option<iced::window::Id>,
-    desktop_id: Option<iced::window::Id>,
+    desk: desk::Desk<iced::window::Id>,
     popup_id: Option<iced::window::Id>,
+    tray: tray::TrayHandle,
     open: Option<OpenCard>,
     opened_at: Option<Instant>,
     smoke_time: f32,
@@ -242,15 +241,17 @@ enum Message {
     Opened(iced::window::Id),
     CloseRequested(iced::window::Id),
     Boot,
+    Background,
+    Tray(tray::TrayEvent),
 }
 
 impl App {
     fn new() -> Self {
         let requested = std::env::var("RETENTION_ROOT").ok();
         let data = data_dir();
-        let chosen = data.as_ref().and_then(|dir| {
-            choose_root(dir, requested.as_deref().filter(|id| !id.is_empty()))
-        });
+        let chosen = data
+            .as_ref()
+            .and_then(|dir| choose_root(dir, requested.as_deref().filter(|id| !id.is_empty())));
         let study = data
             .as_ref()
             .zip(chosen.as_ref())
@@ -275,8 +276,9 @@ impl App {
             name_draft: String::new(),
             pending: None,
             shell_id: None,
-            desktop_id: None,
+            desk: desk::Desk::Absent,
             popup_id: None,
+            tray: tray::TrayHandle::start(),
             open: None,
             opened_at: None,
             smoke_time: 0.0,
@@ -285,14 +287,16 @@ impl App {
 
     fn subscription(state: &Self) -> Subscription<Message> {
         let tick = iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick);
-        let smoke = state.popup_id.is_some().then(|| {
-            iced::time::every(Duration::from_millis(32)).map(|_| Message::Glow)
-        });
+        let smoke = state
+            .popup_id
+            .is_some()
+            .then(|| iced::time::every(Duration::from_millis(32)).map(|_| Message::Glow));
         Subscription::batch(
             std::iter::once(tick)
                 .chain(smoke)
                 .chain(std::iter::once(iced::event::listen_with(listen)))
-                .chain(std::iter::once(Subscription::run(boot_stream))),
+                .chain(std::iter::once(Subscription::run(boot_stream)))
+                .chain(std::iter::once(tray::subscription().map(Message::Tray))),
         )
     }
 
@@ -434,7 +438,10 @@ impl App {
             Message::EditDeck(name) => self.edit_deck(name),
             Message::AskDelete => {
                 self.pending = match self.page {
-                    Page::Root => self.catalog.open_id().map(|id| Pending::Root(id.to_string())),
+                    Page::Root => self
+                        .catalog
+                        .open_id()
+                        .map(|id| Pending::Root(id.to_string())),
                     Page::Deck => self.selected.clone().map(Pending::Deck),
                     _ => None,
                 };
@@ -446,14 +453,15 @@ impl App {
             }
             Message::ConfirmDelete => self.confirm_delete(),
             Message::Opened(id) => self.opened(id),
-            Message::Boot => self.open_desktop(),
+            Message::Boot => self.apply_desk(desk::DeskInput::ShellReady),
+            Message::Background => self.apply_desk(desk::DeskInput::Background),
+            Message::Tray(tray::TrayEvent::Open) => self.apply_desk(desk::DeskInput::Foreground),
+            Message::Tray(tray::TrayEvent::Quit) => iced::exit(),
             Message::CloseRequested(id) => {
-                if self.desktop_id == Some(id) {
-                    iced::exit()
-                } else if self.popup_id == Some(id) {
+                if self.popup_id == Some(id) {
                     self.dismiss()
                 } else {
-                    Task::none()
+                    self.apply_desk(desk::DeskInput::Close(id))
                 }
             }
             _ => Task::none(),
@@ -750,29 +758,72 @@ impl App {
         if self.popup_id == Some(id) {
             return Task::none();
         }
-        if self.desktop_id == Some(id) {
-            let Some(shell) = self.shell_id else {
-                return Task::none();
-            };
-            return Task::done(Message::RemoveWindow(shell));
+        let desk_window = match self.desk {
+            desk::Desk::Opening(open) if open == id => true,
+            desk::Desk::Shown(shown) if shown == id => true,
+            _ => false,
+        };
+        if desk_window {
+            return self.apply_desk(desk::DeskInput::WindowOpened(id));
         }
         if self.shell_id.is_none() {
             self.shell_id = Some(id);
         }
-        self.open_desktop()
+        if matches!(self.desk, desk::Desk::Shown(_)) {
+            return self.remove_shell();
+        }
+        self.apply_desk(desk::DeskInput::ShellReady)
     }
 
-    fn open_desktop(&mut self) -> Task<Message> {
-        if self.desktop_id.is_some() {
-            return Task::none();
+    fn apply_desk(&mut self, input: desk::DeskInput<iced::window::Id>) -> Task<Message> {
+        let before = self.desk;
+        let (next, effects) = desk::step(before, input, self.tray.ready());
+        self.desk = next;
+        let mut tasks = Vec::new();
+        let mut refused = false;
+        for effect in effects {
+            match effect {
+                desk::DeskEffect::OpenWindow => {
+                    if matches!(before, desk::Desk::Absent | desk::Desk::Hidden) {
+                        let (id, task) = Message::base_window_open(
+                            iced_layershell::actions::IcedXdgWindowSettings {
+                                size: Some((960, 680)),
+                                client_side_decorations: false,
+                            },
+                        );
+                        self.desk = desk::Desk::Opening(id);
+                        tasks.push(task);
+                    }
+                }
+                desk::DeskEffect::CloseWindow(id) => {
+                    tasks.push(Task::done(Message::RemoveWindow(id)));
+                }
+                desk::DeskEffect::RemoveShell => {
+                    if let Some(shell) = self.shell_id.take() {
+                        tasks.push(Task::done(Message::RemoveWindow(shell)));
+                    }
+                }
+                desk::DeskEffect::Exit => tasks.push(iced::exit()),
+                desk::DeskEffect::Refuse => {
+                    refused = true;
+                    self.status = "Tray is not available".into();
+                }
+            }
         }
-        let (desktop, task) =
-            Message::base_window_open(iced_layershell::actions::IcedXdgWindowSettings {
-                size: Some((960, 680)),
-                client_side_decorations: false,
-            });
-        self.desktop_id = Some(desktop);
-        task
+        if matches!(input, desk::DeskInput::Background) && !refused {
+            self.status.clear();
+        }
+        if !refused {
+            self.tray.set_visible(desk::tray_visible(&self.desk));
+        }
+        Task::batch(tasks)
+    }
+
+    fn remove_shell(&mut self) -> Task<Message> {
+        match self.shell_id.take() {
+            Some(shell) => Task::done(Message::RemoveWindow(shell)),
+            None => Task::none(),
+        }
     }
 
     fn desktop(&self) -> Element<'_, Message> {
@@ -988,6 +1039,7 @@ impl App {
                 ),
             ]
             .spacing(8),
+            wide("Run in background", Message::Background),
         ]
         .spacing(10)
         .into()
@@ -1151,7 +1203,11 @@ fn block_line(block: &markdown::Block) -> Element<'static, Message> {
         .into()
 }
 
-fn mark_span(value: impl Into<String>, size: f32, font: iced::Font) -> iced::widget::text::Span<'static, (), iced::Font> {
+fn mark_span(
+    value: impl Into<String>,
+    size: f32,
+    font: iced::Font,
+) -> iced::widget::text::Span<'static, (), iced::Font> {
     iced::widget::text::Span::new(value.into())
         .size(size)
         .font(font)
@@ -1203,12 +1259,16 @@ fn wide(label: impl Into<String>, message: Message) -> Element<'static, Message>
 }
 
 fn marked(label: impl Into<String>, on: bool, message: Message) -> Element<'static, Message> {
-    button(text(label.into()).size(14).color(if on { INK } else { GOLD }))
-        .on_press(message)
-        .width(Length::Fill)
-        .padding([8, 12])
-        .style(move |_, status| gold_style(on, status))
-        .into()
+    button(
+        text(label.into())
+            .size(14)
+            .color(if on { INK } else { GOLD }),
+    )
+    .on_press(message)
+    .width(Length::Fill)
+    .padding([8, 12])
+    .style(move |_, status| gold_style(on, status))
+    .into()
 }
 
 fn draft_row(
@@ -1369,7 +1429,10 @@ struct Face {
 
 #[derive(Clone)]
 enum FaceBody {
-    Sides { prompt: String, answer: String },
+    Sides {
+        prompt: String,
+        answer: String,
+    },
     Choice {
         prompt: String,
         choices: Vec<(String, String)>,
@@ -1489,11 +1552,7 @@ fn choose_root(data_dir: &Path, requested: Option<&str>) -> Option<String> {
         };
         names.push(name);
     }
-    if names.len() == 1 {
-        names.pop()
-    } else {
-        None
-    }
+    if names.len() == 1 { names.pop() } else { None }
 }
 
 fn load_study(data_dir: &Path, root_id: &str) -> Option<Study> {
@@ -1623,7 +1682,10 @@ fn parse_shown(text: &str) -> Option<Vec<(String, i64)>> {
         .ok()?;
     let rows = stmt
         .query_map(params![text], |row| {
-            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<i64>>(1)?))
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+            ))
         })
         .ok()?;
     let mut shown = Vec::new();
@@ -1739,7 +1801,8 @@ fn rules_for(
             end,
             gap_minutes,
         }) => {
-            let window = session::Window::new(i32::try_from(*start).ok()?, i32::try_from(*end).ok()?)?;
+            let window =
+                session::Window::new(i32::try_from(*start).ok()?, i32::try_from(*end).ok()?)?;
             let gap = session::Gap::from_seconds(gap_minutes.saturating_mul(60))?;
             Some((window, gap))
         }
@@ -1861,7 +1924,10 @@ fn cloze_sides(text: &str) -> (String, String) {
             break;
         };
         let inner = &after[inner_at..inner_at + end];
-        let revealed = inner.split_once("::").map(|(answer, _)| answer).unwrap_or(inner);
+        let revealed = inner
+            .split_once("::")
+            .map(|(answer, _)| answer)
+            .unwrap_or(inner);
         prompt.push_str("[...]");
         answer.push_str(revealed);
         rest = &after[inner_at + end + 2..];
@@ -1982,7 +2048,11 @@ mod tests {
             session.next_allowed(&picked.deck).map(session::Unix::get),
             Some(1_700_000_005)
         );
-        assert!(session.pick(session::Unix::new(1_700_000_004), minute(1439)).is_none());
+        assert!(
+            session
+                .pick(session::Unix::new(1_700_000_004), minute(1439))
+                .is_none()
+        );
     }
 
     #[test]
@@ -2005,7 +2075,10 @@ mod tests {
                 due_unix: session::Unix::new(80),
             },
         ));
-        assert_eq!(session.next_allowed(&deck).map(session::Unix::get), Some(55));
+        assert_eq!(
+            session.next_allowed(&deck).map(session::Unix::get),
+            Some(55)
+        );
 
         let decks = parse_decks(
             r#"[{"name":"Spanish::Verbs","delivery":{"start":100,"end":200,"gap":2}}]"#,
@@ -2025,7 +2098,10 @@ mod tests {
                 due_unix: session::Unix::new(80),
             },
         ));
-        assert_eq!(session.next_allowed(&deck).map(session::Unix::get), Some(170));
+        assert_eq!(
+            session.next_allowed(&deck).map(session::Unix::get),
+            Some(170)
+        );
     }
 
     #[test]
@@ -2153,13 +2229,19 @@ The {{c1::capital::city}}.\tclozeGuid01
         assert_eq!(rows[0].stability, scheduled.memory.stability);
         assert_eq!(rows[0].difficulty, scheduled.memory.difficulty);
         assert_eq!(rows[0].stability_fast, scheduled.memory.stability_fast);
-        let shown = parse_shown(&std::fs::read_to_string(study.dir.join("shown.json")).unwrap()).unwrap();
+        let shown =
+            parse_shown(&std::fs::read_to_string(study.dir.join("shown.json")).unwrap()).unwrap();
         assert_eq!(shown, vec![("Spanish::Verbs".to_string(), now + 5)]);
         let deck = session::DeckName::new("Spanish::Verbs").unwrap();
         let guid = session::Guid::new("abc123XYZ0").unwrap();
         let ord = session::CardOrd::new(0).unwrap();
         assert!(study.session.due_unix(&deck, &guid, ord).unwrap().get() <= now + 4);
-        assert!(study.session.pick(session::Unix::new(now + 4), minute(0)).is_none());
+        assert!(
+            study
+                .session
+                .pick(session::Unix::new(now + 4), minute(0))
+                .is_none()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
