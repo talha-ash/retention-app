@@ -155,7 +155,7 @@ impl Tray for RetentionTray {
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        vec![gold_disk()]
+        vec![disk()]
     }
 
     fn tool_tip(&self) -> ToolTip {
@@ -183,7 +183,7 @@ impl Tray for RetentionTray {
     }
 }
 
-fn gold_disk() -> ksni::Icon {
+fn disk() -> ksni::Icon {
     const SIZE: i32 = 22;
     let mut data = vec![0; (SIZE * SIZE * 4) as usize];
     let radius = SIZE as f32 / 2.0;
@@ -197,9 +197,9 @@ fn gold_disk() -> ksni::Icon {
             let at = ((y * SIZE + x) * 4) as usize;
             // ARGB32, network byte order. ksni's Icon example rotates RGBA to this order.
             data[at] = 255;
-            data[at + 1] = 232;
-            data[at + 2] = 195;
-            data[at + 3] = 114;
+            data[at + 1] = 110;
+            data[at + 2] = 158;
+            data[at + 3] = 235;
         }
     }
     ksni::Icon {
@@ -219,13 +219,13 @@ mod tests {
     }
 
     #[test]
-    fn gold_disk_is_opaque_inside_and_clear_outside() {
-        let icon = gold_disk();
+    fn disk_is_opaque_inside_and_clear_outside() {
+        let icon = disk();
         assert_eq!((icon.width, icon.height), (22, 22));
         assert_eq!(icon.data.len(), 22 * 22 * 4);
-        assert_eq!(pixel(&icon, 11, 11), [255, 232, 195, 114]);
-        assert_eq!(pixel(&icon, 10, 10), [255, 232, 195, 114]);
-        assert_eq!(pixel(&icon, 0, 11), [255, 232, 195, 114]);
+        assert_eq!(pixel(&icon, 11, 11), [255, 110, 158, 235]);
+        assert_eq!(pixel(&icon, 10, 10), [255, 110, 158, 235]);
+        assert_eq!(pixel(&icon, 0, 11), [255, 110, 158, 235]);
         assert_eq!(pixel(&icon, 0, 0), [0, 0, 0, 0]);
         assert_eq!(pixel(&icon, 21, 21), [0, 0, 0, 0]);
     }
