@@ -624,7 +624,7 @@ impl App {
     fn go(&mut self, page: Page) -> Task<Message> {
         let needs_root = matches!(page, Page::Decks | Page::Deck | Page::Import);
         if needs_root && self.catalog.open_id().is_none() {
-            self.status = "Open a root".to_string();
+            self.status = "Choose a library first.".to_string();
             self.page = Page::Roots;
             return Task::none();
         }
@@ -837,9 +837,12 @@ impl App {
         container(
             column![
                 text("Retention").size(20).color(GOLD),
-                self.nav("Roots", Page::Roots),
+                text(self.catalog.open_id().unwrap_or("No library"))
+                    .size(13)
+                    .color(MUTED),
+                self.nav("Libraries", Page::Roots),
                 self.nav("Decks", Page::Decks),
-                self.nav("Import", Page::Import),
+                self.nav("Notes", Page::Import),
                 self.nav("Settings", Page::Settings),
                 Space::new().height(Length::Fill),
                 wide("Quit", Message::Quit),
@@ -871,6 +874,7 @@ impl App {
     fn page_body(&self) -> Element<'_, Message> {
         let mut body = Column::new().spacing(12).width(Length::Fill);
         body = body.push(text(self.page_title()).size(26).color(FG));
+        body = body.push(text(self.page_line()).size(14).color(MUTED));
         if !self.status.is_empty() {
             body = body.push(text(&self.status).size(14).color(GOLD));
         }
@@ -889,16 +893,27 @@ impl App {
 
     fn page_title(&self) -> String {
         match self.page {
-            Page::Roots => "Roots".to_string(),
-            Page::Root => "Edit root".to_string(),
+            Page::Roots => "Libraries".to_string(),
+            Page::Root => "Library".to_string(),
             Page::Decks => self
                 .catalog
                 .open_id()
                 .map(|id| format!("Decks in {id}"))
                 .unwrap_or_else(|| "Decks".to_string()),
-            Page::Deck => "Edit deck".to_string(),
-            Page::Import => "Import".to_string(),
+            Page::Deck => "Deck".to_string(),
+            Page::Import => "Notes".to_string(),
             Page::Settings => "Settings".to_string(),
+        }
+    }
+
+    fn page_line(&self) -> &'static str {
+        match self.page {
+            Page::Roots => "Each library has its own cards and schedule.",
+            Page::Root => "Cards from this library appear between these times.",
+            Page::Decks => "A deck can keep the library schedule or use its own.",
+            Page::Deck => "Use the library schedule, or set times for this deck only.",
+            Page::Import => "Put a .txt, .tsv, or .apkg file in the inbox, then choose it here.",
+            Page::Settings => "Due cards open in this corner.",
         }
     }
 
@@ -916,19 +931,19 @@ impl App {
     fn roots_page(&self) -> Element<'_, Message> {
         let mut list = Column::new().spacing(8).width(Length::Fill);
         if self.catalog.root_ids().is_empty() {
-            list = list.push(text("No root").size(14).color(MUTED));
+            list = list.push(text("No library yet.").size(14).color(MUTED));
         }
         for id in self.catalog.root_ids() {
             let on = self.catalog.open_id() == Some(id.as_str());
             list = list.push(
                 row![
                     marked(id.clone(), on, Message::OpenRoot(id.clone())),
-                    action(format!("Edit {id}"), Message::EditRoot(id.clone())),
+                    action("Edit", Message::EditRoot(id.clone())),
                 ]
                 .spacing(8),
             );
         }
-        list = list.push(wide("New root", Message::NewRoot));
+        list = list.push(wide("New library", Message::NewRoot));
         list.into()
     }
 
@@ -951,18 +966,18 @@ impl App {
     fn decks_page(&self) -> Element<'_, Message> {
         let mut list = Column::new().spacing(8).width(Length::Fill);
         if self.catalog.open_id().is_none() {
-            return text("Open a root").size(14).color(MUTED).into();
+            return text("Choose a library first.").size(14).color(MUTED).into();
         }
         if self.catalog.decks().is_empty() {
-            list = list.push(text("No decks").size(14).color(MUTED));
+            list = list.push(text("No decks yet.").size(14).color(MUTED));
         }
         for deck in self.catalog.decks() {
             let kind = match deck.delivery {
-                library::DeliveryChoice::Inherit => "inherit",
-                library::DeliveryChoice::Override { .. } => "override",
+                library::DeliveryChoice::Inherit => "library schedule",
+                library::DeliveryChoice::Override { .. } => "its own schedule",
             };
             list = list.push(marked(
-                format!("{} {kind}", deck.name),
+                format!("{} · {kind}", deck.name),
                 false,
                 Message::EditDeck(deck.name.clone()),
             ));
@@ -979,8 +994,8 @@ impl App {
                 .size(16)
                 .width(Length::Fill),
             row![
-                marked("Inherit", !self.draft_open, Message::SetInherit),
-                marked("Override", self.draft_open, Message::OpenDraft),
+                marked("Library schedule", !self.draft_open, Message::SetInherit),
+                marked("Its own schedule", self.draft_open, Message::OpenDraft),
             ]
             .spacing(8),
         ]
@@ -996,17 +1011,17 @@ impl App {
 
     fn import_page(&self) -> Element<'_, Message> {
         if self.catalog.open_id().is_none() {
-            return text("Open a root").size(14).color(MUTED).into();
+            return text("Choose a library first.").size(14).color(MUTED).into();
         }
         let mut list = Column::new().spacing(8).width(Length::Fill);
         let inbox = self.catalog.inbox();
         if inbox.is_empty() {
-            list = list.push(text("No file").size(14).color(MUTED));
+            list = list.push(text("Nothing is waiting in the inbox.").size(14).color(MUTED));
         }
         for name in inbox {
-            list = list.push(wide(name.clone(), Message::Import(name)));
+            list = list.push(wide(format!("Add {name}"), Message::Import(name)));
         }
-        list = list.push(wide("Export", Message::Export));
+        list = list.push(wide("Export notes", Message::Export));
         list.into()
     }
 
@@ -1039,6 +1054,9 @@ impl App {
                 ),
             ]
             .spacing(8),
+            text("Hide this window. The tray icon brings it back.")
+                .size(14)
+                .color(MUTED),
             wide("Run in background", Message::Background),
         ]
         .spacing(10)
@@ -1048,25 +1066,25 @@ impl App {
     fn schedule_editor(&self) -> Element<'_, Message> {
         column![
             draft_row(
-                format!("start {}", self.draft_start),
-                "Start up",
-                Message::StartUp,
-                "Start down",
+                format!("From {}", clock(self.draft_start)),
+                "Earlier",
                 Message::StartDown,
+                "Later",
+                Message::StartUp,
             ),
             draft_row(
-                format!("end {}", self.draft_end),
-                "End up",
-                Message::EndUp,
-                "End down",
+                format!("Until {}", clock(self.draft_end)),
+                "Earlier",
                 Message::EndDown,
+                "Later",
+                Message::EndUp,
             ),
             draft_row(
-                format!("gap {}", self.draft_gap),
-                "Gap up",
-                Message::GapUp,
-                "Gap down",
+                every(self.draft_gap),
+                "Shorter",
                 Message::GapDown,
+                "Longer",
+                Message::GapUp,
             ),
         ]
         .spacing(8)
@@ -1078,15 +1096,20 @@ impl App {
             (Some(Pending::Root(_)), Page::Root) | (Some(Pending::Deck(_)), Page::Deck) => true,
             _ => false,
         };
+        let (label, confirm) = if self.page == Page::Deck {
+            ("Delete deck", "Delete this deck")
+        } else {
+            ("Delete library", "Delete this library")
+        };
         if asking {
             row![
-                wide("Confirm delete", Message::ConfirmDelete),
+                wide(confirm, Message::ConfirmDelete),
                 wide("Cancel", Message::CancelDelete),
             ]
             .spacing(8)
             .into()
         } else {
-            wide("Delete", Message::AskDelete)
+            wide(label, Message::AskDelete)
         }
     }
 
@@ -1273,15 +1296,15 @@ fn marked(label: impl Into<String>, on: bool, message: Message) -> Element<'stat
 
 fn draft_row(
     label: String,
-    up: &'static str,
-    up_message: Message,
-    down: &'static str,
-    down_message: Message,
+    lower: &'static str,
+    lower_message: Message,
+    higher: &'static str,
+    higher_message: Message,
 ) -> Element<'static, Message> {
     row![
         text(label).size(14).color(FG),
-        action(up, up_message),
-        action(down, down_message),
+        action(lower, lower_message),
+        action(higher, higher_message),
     ]
     .spacing(8)
     .into()
@@ -1291,14 +1314,23 @@ fn slide(value: i64, step: i64, low: i64, high: i64) -> i64 {
     value.saturating_add(step).clamp(low, high)
 }
 
+fn clock(minutes: i64) -> String {
+    let minutes = minutes.clamp(0, 1440);
+    format!("{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
+fn every(minutes: i64) -> String {
+    format!("Every {minutes} min")
+}
+
 fn catalog_status(err: library::Error) -> &'static str {
     match err {
-        library::Error::BadWindow => "Bad window",
-        library::Error::MissingRoot => "Missing root",
-        library::Error::MissingDeck => "Missing deck",
-        library::Error::BadFileName => "Bad file name",
-        library::Error::Failed => "Failed",
-        library::Error::Exists => "Already exists",
+        library::Error::BadWindow => "The end has to be after the start.",
+        library::Error::MissingRoot => "Choose a library first.",
+        library::Error::MissingDeck => "That deck is gone.",
+        library::Error::BadFileName => "That file cannot be imported.",
+        library::Error::Failed => "That did not work.",
+        library::Error::Exists => "That name is already used.",
     }
 }
 
@@ -2258,6 +2290,22 @@ The {{c1::capital::city}}.\tclozeGuid01
         assert!(!pid_busy(Some(4), 9, |_| false));
         assert_eq!(parse_pid("42\n"), Some(42));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clock_reads_minutes_since_midnight() {
+        assert_eq!(clock(0), "00:00");
+        assert_eq!(clock(540), "09:00");
+        assert_eq!(clock(1080), "18:00");
+        assert_eq!(clock(1439), "23:59");
+        assert_eq!(clock(1440), "24:00");
+        assert_eq!(clock(-5), "00:00");
+    }
+
+    #[test]
+    fn every_states_the_gap() {
+        assert_eq!(every(45), "Every 45 min");
+        assert_eq!(every(1), "Every 1 min");
     }
 
     fn scratch() -> PathBuf {
