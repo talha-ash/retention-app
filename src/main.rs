@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use iced::gradient::Linear;
 use iced::widget::shader::Shader;
 use iced::widget::{
-    Column, Space, Stack, button, column, container, row, scrollable, text, text_input,
+    Column, Row, Space, Stack, button, column, container, row, scrollable, text, text_input,
 };
 use iced::{
     Background, Border, Color, Element, Length, Radians, Shadow, Subscription, Task, Theme, Vector,
@@ -149,7 +149,7 @@ struct App {
     draft_end: i64,
     draft_gap: i64,
     status: String,
-    page: Page,
+    place: Place,
     name_draft: String,
     pending: Option<Pending>,
     shell_id: Option<iced::window::Id>,
@@ -189,14 +189,18 @@ impl Corner {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Page {
-    Roots,
-    Root,
-    Decks,
-    Deck,
-    Import,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Place {
+    Libraries,
+    Inside(Focus),
     Settings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Focus {
+    Library,
+    Deck(String),
+    Notes,
 }
 
 enum Pending {
@@ -215,7 +219,6 @@ enum Message {
     Grade(retention_popup::Grade),
     Glow,
     Quit,
-    OpenRoot(String),
     NewRoot,
     SelectDeck(String),
     NewDeck,
@@ -230,7 +233,9 @@ enum Message {
     Save,
     Import(String),
     Export,
-    Go(Page),
+    Libraries,
+    Settings,
+    Notes,
     NameChanged(String),
     SavePage,
     EditRoot(String),
@@ -272,7 +277,7 @@ impl App {
             draft_end: 1080,
             draft_gap: 45,
             status: String::new(),
-            page: Page::Roots,
+            place: Place::Libraries,
             name_draft: String::new(),
             pending: None,
             shell_id: None,
@@ -338,39 +343,28 @@ impl App {
                 Task::none()
             }
             Message::Quit => iced::exit(),
-            Message::OpenRoot(id) => {
-                let same = self.catalog.open_id() == Some(id.as_str());
-                let opened = self.catalog.open(&id);
-                if self.finish(opened) {
-                    if !same {
-                        self.selected = None;
-                        self.draft_open = false;
-                    }
-                    self.page = Page::Decks;
-                    self.pending = None;
+            Message::NewRoot => match self.catalog.create_root() {
+                Ok(id) => self.edit_root(id),
+                Err(err) => {
+                    let _ = self.finish(Err(err));
+                    Task::none()
                 }
-                Task::none()
-            }
-            Message::NewRoot => {
-                let created = self.catalog.create_root().map(|_| ());
-                if self.finish(created) {
-                    self.selected = None;
-                    self.draft_open = false;
-                    self.page = Page::Decks;
-                    self.pending = None;
-                }
-                Task::none()
-            }
+            },
             Message::SelectDeck(name) => {
                 self.selected = Some(name);
                 self.draft_open = false;
                 Task::none()
             }
-            Message::NewDeck => {
-                let created = self.catalog.create_deck().map(|_| ());
-                let _ = self.finish(created);
-                Task::none()
-            }
+            Message::NewDeck => match self.catalog.create_deck() {
+                Ok(name) => {
+                    let _ = self.finish(Ok(()));
+                    self.edit_deck(name)
+                }
+                Err(err) => {
+                    let _ = self.finish(Err(err));
+                    Task::none()
+                }
+            },
             Message::SetInherit => {
                 self.draft_open = false;
                 Task::none()
@@ -428,7 +422,21 @@ impl App {
                 let _ = self.finish(exported);
                 Task::none()
             }
-            Message::Go(page) => self.go(page),
+            Message::Libraries => {
+                self.place = Place::Libraries;
+                self.pending = None;
+                Task::none()
+            }
+            Message::Settings => {
+                self.place = Place::Settings;
+                self.pending = None;
+                Task::none()
+            }
+            Message::Notes => {
+                self.place = Place::Inside(Focus::Notes);
+                self.pending = None;
+                Task::none()
+            }
             Message::NameChanged(value) => {
                 self.name_draft = value;
                 Task::none()
@@ -437,12 +445,12 @@ impl App {
             Message::EditRoot(id) => self.edit_root(id),
             Message::EditDeck(name) => self.edit_deck(name),
             Message::AskDelete => {
-                self.pending = match self.page {
-                    Page::Root => self
+                self.pending = match &self.place {
+                    Place::Inside(Focus::Library) => self
                         .catalog
                         .open_id()
                         .map(|id| Pending::Root(id.to_string())),
-                    Page::Deck => self.selected.clone().map(Pending::Deck),
+                    Place::Inside(Focus::Deck(_)) => self.selected.clone().map(Pending::Deck),
                     _ => None,
                 };
                 Task::none()
@@ -621,19 +629,6 @@ impl App {
         }
     }
 
-    fn go(&mut self, page: Page) -> Task<Message> {
-        let needs_root = matches!(page, Page::Decks | Page::Deck | Page::Import);
-        if needs_root && self.catalog.open_id().is_none() {
-            self.status = "Choose a library first.".to_string();
-            self.page = Page::Roots;
-            return Task::none();
-        }
-        self.page = page;
-        self.pending = None;
-        self.status.clear();
-        Task::none()
-    }
-
     fn edit_root(&mut self, id: String) -> Task<Message> {
         let opened = self.catalog.open(&id);
         if self.finish(opened) {
@@ -643,7 +638,7 @@ impl App {
                 self.draft_end = rules.end;
                 self.draft_gap = rules.gap;
             }
-            self.page = Page::Root;
+            self.place = Place::Inside(Focus::Library);
             self.pending = None;
             self.selected = None;
         }
@@ -669,63 +664,62 @@ impl App {
             self.draft_open = false;
         }
         self.selected = Some(name.clone());
-        self.name_draft = name;
-        self.page = Page::Deck;
+        self.name_draft = name.clone();
+        self.place = Place::Inside(Focus::Deck(name));
         self.pending = None;
         self.status.clear();
         Task::none()
     }
 
     fn save_page(&mut self) -> Task<Message> {
-        match self.page {
-            Page::Root => {
-                let Some(id) = self.catalog.open_id().map(str::to_string) else {
-                    return Task::none();
-                };
-                let renamed = if self.name_draft.trim() != id {
-                    self.catalog.rename_root(&id, &self.name_draft)
-                } else {
-                    Ok(())
-                };
-                if !self.finish(renamed) {
-                    return Task::none();
-                }
-                let saved =
-                    self.catalog
-                        .set_root_rules(self.draft_start, self.draft_end, self.draft_gap);
-                let _ = self.finish(saved);
+        if matches!(&self.place, Place::Inside(Focus::Library)) {
+            let Some(id) = self.catalog.open_id().map(str::to_string) else {
+                return Task::none();
+            };
+            let renamed = if self.name_draft.trim() != id {
+                self.catalog.rename_root(&id, &self.name_draft)
+            } else {
+                Ok(())
+            };
+            if !self.finish(renamed) {
+                return Task::none();
             }
-            Page::Deck => {
-                let Some(name) = self.selected.clone() else {
-                    return Task::none();
-                };
-                let renamed = if self.name_draft.trim() != name {
-                    self.catalog.rename_deck(&name, &self.name_draft)
-                } else {
-                    Ok(())
-                };
-                if !self.finish(renamed) {
-                    return Task::none();
-                }
-                let current = if self.name_draft.trim() != name {
-                    self.name_draft.trim().to_string()
-                } else {
-                    name
-                };
-                self.selected = Some(current.clone());
-                let saved = if self.draft_open {
-                    self.catalog.set_override(
-                        &current,
-                        self.draft_start,
-                        self.draft_end,
-                        self.draft_gap,
-                    )
-                } else {
-                    self.catalog.set_inherit(&current)
-                };
-                let _ = self.finish(saved);
+            let saved =
+                self.catalog
+                    .set_root_rules(self.draft_start, self.draft_end, self.draft_gap);
+            let _ = self.finish(saved);
+            return Task::none();
+        }
+        if matches!(&self.place, Place::Inside(Focus::Deck(_))) {
+            let Some(name) = self.selected.clone() else {
+                return Task::none();
+            };
+            let renamed = if self.name_draft.trim() != name {
+                self.catalog.rename_deck(&name, &self.name_draft)
+            } else {
+                Ok(())
+            };
+            if !self.finish(renamed) {
+                return Task::none();
             }
-            _ => {}
+            let current = if self.name_draft.trim() != name {
+                self.name_draft.trim().to_string()
+            } else {
+                name
+            };
+            self.selected = Some(current.clone());
+            self.place = Place::Inside(Focus::Deck(current.clone()));
+            let saved = if self.draft_open {
+                self.catalog.set_override(
+                    &current,
+                    self.draft_start,
+                    self.draft_end,
+                    self.draft_gap,
+                )
+            } else {
+                self.catalog.set_inherit(&current)
+            };
+            let _ = self.finish(saved);
         }
         Task::none()
     }
@@ -738,7 +732,7 @@ impl App {
             Pending::Root(id) => {
                 let removed = self.catalog.delete_root(&id);
                 if self.finish(removed) && self.catalog.open_id().is_none() {
-                    self.page = Page::Roots;
+                    self.place = Place::Libraries;
                     self.selected = None;
                     return self.dismiss();
                 }
@@ -747,7 +741,10 @@ impl App {
                 let removed = self.catalog.delete_deck(&name);
                 if self.finish(removed) {
                     self.selected = None;
-                    self.page = Page::Decks;
+                    self.place = Place::Inside(Focus::Library);
+                    if let Some(id) = self.catalog.open_id().map(str::to_string) {
+                        return self.edit_root(id);
+                    }
                 }
             }
         }
@@ -827,48 +824,90 @@ impl App {
     }
 
     fn desktop(&self) -> Element<'_, Message> {
-        row![self.rail(), self.page_body()]
+        column![
+            self.top_bar(),
+            row![self.rail(), self.page_body()]
+                .width(Length::Fill)
+                .height(Length::Fill),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
+    fn top_bar(&self) -> Element<'_, Message> {
+        let inside = matches!(&self.place, Place::Inside(_));
+        let open = self.catalog.open_id().map(str::to_string);
+        let mut bar = Row::new()
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
             .width(Length::Fill)
-            .height(Length::Fill)
+            .push(text("Retention").size(20).color(GOLD))
+            .push(bar_item(
+                "Libraries",
+                matches!(&self.place, Place::Libraries),
+                Message::Libraries,
+            ));
+        for id in self.catalog.root_ids() {
+            let on = inside && open.as_deref() == Some(id.as_str());
+            bar = bar.push(bar_item(id.clone(), on, Message::EditRoot(id.clone())));
+        }
+        bar = bar.push(bar_item(
+            "Settings",
+            matches!(&self.place, Place::Settings),
+            Message::Settings,
+        ));
+        container(bar)
+            .width(Length::Fill)
+            .padding(18)
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color::from_rgb8(0x12, 0x14, 0x1e))),
+                text_color: Some(FG),
+                ..Default::default()
+            })
             .into()
     }
 
     fn rail(&self) -> Element<'_, Message> {
-        container(
-            column![
-                text("Retention").size(20).color(GOLD),
-                text(self.catalog.open_id().unwrap_or("No library"))
-                    .size(13)
-                    .color(MUTED),
-                self.nav("Libraries", Page::Roots),
-                self.nav("Decks", Page::Decks),
-                self.nav("Notes", Page::Import),
-                self.nav("Settings", Page::Settings),
-                Space::new().height(Length::Fill),
-                wide("Quit", Message::Quit),
-            ]
+        let open_here = matches!(&self.place, Place::Inside(_));
+        let notes = matches!(&self.place, Place::Inside(Focus::Notes));
+        let deck_name = match &self.place {
+            Place::Inside(Focus::Deck(name)) => Some(name.clone()),
+            _ => None,
+        };
+        let mut items = Column::new()
             .spacing(10)
             .height(Length::Fill)
-            .width(Length::Fill),
-        )
-        .width(Length::Fixed(196.0))
-        .height(Length::Fill)
-        .padding(18)
-        .style(|_| container::Style {
-            background: Some(Background::Color(Color::from_rgb8(0x12, 0x14, 0x1e))),
-            text_color: Some(FG),
-            ..Default::default()
-        })
-        .into()
-    }
-
-    fn nav(&self, label: &'static str, page: Page) -> Element<'_, Message> {
-        let on = match page {
-            Page::Roots => matches!(self.page, Page::Roots | Page::Root),
-            Page::Decks => matches!(self.page, Page::Decks | Page::Deck),
-            other => self.page == other,
-        };
-        marked(label, on, Message::Go(page))
+            .width(Length::Fill);
+        if open_here {
+            for deck in self.catalog.decks() {
+                let on = deck_name.as_deref() == Some(deck.name.as_str());
+                items = items.push(marked(
+                    deck.name.clone(),
+                    on,
+                    Message::EditDeck(deck.name.clone()),
+                ));
+            }
+            items = items.push(marked("Notes", notes, Message::Notes));
+            items = items.push(wide("New deck", Message::NewDeck));
+        } else {
+            for id in self.catalog.root_ids() {
+                items = items.push(marked(id.clone(), false, Message::EditRoot(id.clone())));
+            }
+            items = items.push(wide("New library", Message::NewRoot));
+        }
+        items = items.push(Space::new().height(Length::Fill));
+        items = items.push(wide("Quit", Message::Quit));
+        container(items)
+            .width(Length::Fixed(196.0))
+            .height(Length::Fill)
+            .padding(18)
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color::from_rgb8(0x12, 0x14, 0x1e))),
+                text_color: Some(FG),
+                ..Default::default()
+            })
+            .into()
     }
 
     fn page_body(&self) -> Element<'_, Message> {
@@ -892,59 +931,37 @@ impl App {
     }
 
     fn page_title(&self) -> String {
-        match self.page {
-            Page::Roots => "Libraries".to_string(),
-            Page::Root => "Library".to_string(),
-            Page::Decks => self
-                .catalog
-                .open_id()
-                .map(|id| format!("Decks in {id}"))
-                .unwrap_or_else(|| "Decks".to_string()),
-            Page::Deck => "Deck".to_string(),
-            Page::Import => "Notes".to_string(),
-            Page::Settings => "Settings".to_string(),
+        match &self.place {
+            Place::Libraries => "Libraries".to_string(),
+            Place::Inside(Focus::Library) => "Library".to_string(),
+            Place::Inside(Focus::Deck(name)) => name.clone(),
+            Place::Inside(Focus::Notes) => "Notes".to_string(),
+            Place::Settings => "Settings".to_string(),
         }
     }
 
     fn page_line(&self) -> &'static str {
-        match self.page {
-            Page::Roots => "Each library has its own cards and schedule.",
-            Page::Root => "Cards from this library appear between these times.",
-            Page::Decks => "A deck can keep the library schedule or use its own.",
-            Page::Deck => "Use the library schedule, or set times for this deck only.",
-            Page::Import => "Put a .txt, .tsv, or .apkg file in the inbox, then choose it here.",
-            Page::Settings => "Due cards open in this corner.",
+        match &self.place {
+            Place::Libraries => "Each library has its own cards and schedule.",
+            Place::Inside(Focus::Library) => "Cards from this library appear between these times.",
+            Place::Inside(Focus::Deck(_)) => {
+                "Use the library schedule, or set times for this deck only."
+            }
+            Place::Inside(Focus::Notes) => {
+                "Put a .txt, .tsv, or .apkg file in the inbox, then choose it here."
+            }
+            Place::Settings => "Due cards open in this corner.",
         }
     }
 
     fn page_content(&self) -> Element<'_, Message> {
-        match self.page {
-            Page::Roots => self.roots_page(),
-            Page::Root => self.root_page(),
-            Page::Decks => self.decks_page(),
-            Page::Deck => self.deck_page(),
-            Page::Import => self.import_page(),
-            Page::Settings => self.settings_page(),
+        match self.place.clone() {
+            Place::Libraries => text("Choose a library.").size(14).color(MUTED).into(),
+            Place::Inside(Focus::Library) => self.root_page(),
+            Place::Inside(Focus::Deck(_)) => self.deck_page(),
+            Place::Inside(Focus::Notes) => self.import_page(),
+            Place::Settings => self.settings_page(),
         }
-    }
-
-    fn roots_page(&self) -> Element<'_, Message> {
-        let mut list = Column::new().spacing(8).width(Length::Fill);
-        if self.catalog.root_ids().is_empty() {
-            list = list.push(text("No library yet.").size(14).color(MUTED));
-        }
-        for id in self.catalog.root_ids() {
-            let on = self.catalog.open_id() == Some(id.as_str());
-            list = list.push(
-                row![
-                    marked(id.clone(), on, Message::OpenRoot(id.clone())),
-                    action("Edit", Message::EditRoot(id.clone())),
-                ]
-                .spacing(8),
-            );
-        }
-        list = list.push(wide("New library", Message::NewRoot));
-        list.into()
     }
 
     fn root_page(&self) -> Element<'_, Message> {
@@ -961,29 +978,6 @@ impl App {
         .spacing(12)
         .width(Length::Fill)
         .into()
-    }
-
-    fn decks_page(&self) -> Element<'_, Message> {
-        let mut list = Column::new().spacing(8).width(Length::Fill);
-        if self.catalog.open_id().is_none() {
-            return text("Choose a library first.").size(14).color(MUTED).into();
-        }
-        if self.catalog.decks().is_empty() {
-            list = list.push(text("No decks yet.").size(14).color(MUTED));
-        }
-        for deck in self.catalog.decks() {
-            let kind = match deck.delivery {
-                library::DeliveryChoice::Inherit => "library schedule",
-                library::DeliveryChoice::Override { .. } => "its own schedule",
-            };
-            list = list.push(marked(
-                format!("{} · {kind}", deck.name),
-                false,
-                Message::EditDeck(deck.name.clone()),
-            ));
-        }
-        list = list.push(wide("New deck", Message::NewDeck));
-        list.into()
     }
 
     fn deck_page(&self) -> Element<'_, Message> {
@@ -1092,11 +1086,12 @@ impl App {
     }
 
     fn delete_row(&self) -> Element<'_, Message> {
-        let asking = match (&self.pending, self.page) {
-            (Some(Pending::Root(_)), Page::Root) | (Some(Pending::Deck(_)), Page::Deck) => true,
-            _ => false,
-        };
-        let (label, confirm) = if self.page == Page::Deck {
+        let asking = matches!(
+            (&self.pending, &self.place),
+            (Some(Pending::Root(_)), Place::Inside(Focus::Library))
+                | (Some(Pending::Deck(_)), Place::Inside(Focus::Deck(_)))
+        );
+        let (label, confirm) = if matches!(&self.place, Place::Inside(Focus::Deck(_))) {
             ("Delete deck", "Delete this deck")
         } else {
             ("Delete library", "Delete this library")
@@ -1282,13 +1277,26 @@ fn wide(label: impl Into<String>, message: Message) -> Element<'static, Message>
 }
 
 fn marked(label: impl Into<String>, on: bool, message: Message) -> Element<'static, Message> {
+    nav_button(label, on, message, Length::Fill)
+}
+
+fn bar_item(label: impl Into<String>, on: bool, message: Message) -> Element<'static, Message> {
+    nav_button(label, on, message, Length::Shrink)
+}
+
+fn nav_button(
+    label: impl Into<String>,
+    on: bool,
+    message: Message,
+    width: Length,
+) -> Element<'static, Message> {
     button(
         text(label.into())
             .size(14)
             .color(if on { INK } else { GOLD }),
     )
     .on_press(message)
-    .width(Length::Fill)
+    .width(width)
     .padding([8, 12])
     .style(move |_, status| gold_style(on, status))
     .into()
