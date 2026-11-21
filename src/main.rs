@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iced::widget::{
-    Column, Row, Space, button, column, container, row, scrollable, text, text_input,
+    Column, Row, Space, button, column, container, mouse_area, row, scrollable, text, text_input,
 };
 use iced::{Background, Border, Color, Element, Length, Subscription, Task, Theme};
 use iced_layershell::build_pattern::daemon;
@@ -239,6 +239,7 @@ enum Message {
     Boot,
     Background,
     Tray(tray::TrayEvent),
+    Drag,
 }
 
 impl App {
@@ -450,6 +451,10 @@ impl App {
                     self.apply_desk(desk::DeskInput::Close(id))
                 }
             }
+            Message::Drag => match self.desk {
+                desk::Desk::Shown(id) => iced::window::drag(id),
+                _ => Task::none(),
+            },
             _ => Task::none(),
         }
     }
@@ -816,15 +821,18 @@ impl App {
             matches!(&self.place, Place::Settings),
             Message::Settings,
         ));
-        container(bar)
-            .width(Length::Fill)
-            .padding(18)
-            .style(|_| container::Style {
-                background: Some(Background::Color(SURFACE)),
-                text_color: Some(FG),
-                ..Default::default()
-            })
-            .into()
+        mouse_area(
+            container(bar)
+                .width(Length::Fill)
+                .padding(18)
+                .style(|_| container::Style {
+                    background: Some(Background::Color(SURFACE)),
+                    text_color: Some(FG),
+                    ..Default::default()
+                }),
+        )
+        .on_press(Message::Drag)
+        .into()
     }
 
     fn rail(&self) -> Element<'_, Message> {
