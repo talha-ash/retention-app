@@ -4,20 +4,15 @@ mod desk;
 mod library;
 mod markdown;
 mod session;
-mod smoke;
 mod tray;
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use iced::gradient::Linear;
-use iced::widget::shader::Shader;
 use iced::widget::{
-    Column, Row, Space, Stack, button, column, container, row, scrollable, text, text_input,
+    Column, Row, Space, button, column, container, row, scrollable, text, text_input,
 };
-use iced::{
-    Background, Border, Color, Element, Length, Radians, Shadow, Subscription, Task, Theme, Vector,
-};
+use iced::{Background, Border, Color, Element, Length, Subscription, Task, Theme};
 use iced_layershell::build_pattern::daemon;
 use iced_layershell::reexport::{
     Anchor, KeyboardInteractivity, Layer, NewLayerShellSettings, OutputOption,
@@ -26,14 +21,13 @@ use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
 use iced_layershell::to_layer_message;
 use rusqlite::{Connection, params};
 
-const BG: Color = Color::from_rgb8(0x1a, 0x1b, 0x26);
-const FG: Color = Color::from_rgb8(0xc0, 0xca, 0xf5);
-const MUTED: Color = Color::from_rgb8(0x56, 0x5f, 0x89);
-const ACCENT: Color = Color::from_rgb8(0x7a, 0xa2, 0xf7);
-const LINE: Color = Color::from_rgb8(0x41, 0x48, 0x68);
-const GOLD: Color = Color::from_rgb8(0xe8, 0xc3, 0x72);
-const GOLD_HOT: Color = Color::from_rgb8(0xff, 0xe1, 0xa8);
-const INK: Color = Color::from_rgb8(0x1a, 0x12, 0x08);
+const BG: Color = Color::from_rgb8(0x24, 0x25, 0x2b);
+const SURFACE: Color = Color::from_rgb8(0x1c, 0x1d, 0x22);
+const FG: Color = Color::from_rgb8(0xe7, 0xe8, 0xec);
+const MUTED: Color = Color::from_rgb8(0x93, 0x96, 0xa3);
+const ACCENT: Color = Color::from_rgb8(0x6e, 0x9e, 0xeb);
+const LINE: Color = Color::from_rgb8(0x3c, 0x3f, 0x4a);
+const ON_ACCENT: Color = Color::from_rgb8(0xf7, 0xf8, 0xfb);
 
 fn boot_stream() -> impl iced::futures::Stream<Item = Message> + Send + 'static {
     iced::stream::channel(1, async |mut sender| {
@@ -52,7 +46,7 @@ fn listen(event: iced::Event, _: iced::event::Status, id: iced::window::Id) -> O
     }
 }
 
-const POPUP_SIZE: (u32, u32) = (652, 552);
+const POPUP_SIZE: (u32, u32) = (460, 360);
 const MARGIN: i32 = 16;
 
 fn main() -> iced_layershell::Result {
@@ -157,8 +151,6 @@ struct App {
     popup_id: Option<iced::window::Id>,
     tray: tray::TrayHandle,
     open: Option<OpenCard>,
-    opened_at: Option<Instant>,
-    smoke_time: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,7 +209,6 @@ enum Message {
     Toggle(String),
     Continue,
     Grade(retention_popup::Grade),
-    Glow,
     Quit,
     NewRoot,
     SelectDeck(String),
@@ -285,20 +276,13 @@ impl App {
             popup_id: None,
             tray: tray::TrayHandle::start(),
             open: None,
-            opened_at: None,
-            smoke_time: 0.0,
         }
     }
 
-    fn subscription(state: &Self) -> Subscription<Message> {
+    fn subscription(_state: &Self) -> Subscription<Message> {
         let tick = iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick);
-        let smoke = state
-            .popup_id
-            .is_some()
-            .then(|| iced::time::every(Duration::from_millis(32)).map(|_| Message::Glow));
         Subscription::batch(
             std::iter::once(tick)
-                .chain(smoke)
                 .chain(std::iter::once(iced::event::listen_with(listen)))
                 .chain(std::iter::once(Subscription::run(boot_stream)))
                 .chain(std::iter::once(tray::subscription().map(Message::Tray))),
@@ -336,12 +320,6 @@ impl App {
                 }
             }
             Message::Grade(grade) => self.grade(grade),
-            Message::Glow => {
-                if let Some(start) = self.opened_at {
-                    self.smoke_time = start.elapsed().as_secs_f32();
-                }
-                Task::none()
-            }
             Message::Quit => iced::exit(),
             Message::NewRoot => match self.catalog.create_root() {
                 Ok(id) => self.edit_root(id),
@@ -549,8 +527,6 @@ impl App {
 
     fn dismiss(&mut self) -> Task<Message> {
         self.open = None;
-        self.opened_at = None;
-        self.smoke_time = 0.0;
         match self.popup_id.take() {
             Some(id) => Task::done(Message::RemoveWindow(id)),
             None => Task::none(),
@@ -601,29 +577,12 @@ impl App {
             namespace: Some("retention-card".into()),
         });
         self.popup_id = Some(id);
-        self.opened_at = Some(Instant::now());
-        self.smoke_time = 0.0;
         task
     }
 
     fn view(&self, id: iced::window::Id) -> Element<'_, Message> {
         if self.popup_id == Some(id) {
-            Stack::with_children([
-                Shader::new(smoke::Smoke {
-                    time: self.smoke_time,
-                })
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into(),
-                container(quest_card(self.study_card()))
-                    .padding(smoke::PAD)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .into(),
-            ])
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+            quest_card(self.study_card())
         } else {
             self.desktop()
         }
@@ -842,7 +801,7 @@ impl App {
             .spacing(8)
             .align_y(iced::Alignment::Center)
             .width(Length::Fill)
-            .push(text("Retention").size(20).color(GOLD))
+            .push(text("Retention").size(20).color(FG))
             .push(bar_item(
                 "Libraries",
                 matches!(&self.place, Place::Libraries),
@@ -861,7 +820,7 @@ impl App {
             .width(Length::Fill)
             .padding(18)
             .style(|_| container::Style {
-                background: Some(Background::Color(Color::from_rgb8(0x12, 0x14, 0x1e))),
+                background: Some(Background::Color(SURFACE)),
                 text_color: Some(FG),
                 ..Default::default()
             })
@@ -903,7 +862,7 @@ impl App {
             .height(Length::Fill)
             .padding(18)
             .style(|_| container::Style {
-                background: Some(Background::Color(Color::from_rgb8(0x12, 0x14, 0x1e))),
+                background: Some(Background::Color(SURFACE)),
                 text_color: Some(FG),
                 ..Default::default()
             })
@@ -915,7 +874,7 @@ impl App {
         body = body.push(text(self.page_title()).size(26).color(FG));
         body = body.push(text(self.page_line()).size(14).color(MUTED));
         if !self.status.is_empty() {
-            body = body.push(text(&self.status).size(14).color(GOLD));
+            body = body.push(text(&self.status).size(14).color(ACCENT));
         }
         body = body.push(self.page_content());
         container(scrollable(body))
@@ -1118,10 +1077,10 @@ impl App {
                     column![
                         reading(&[prompt, answer]),
                         row![
-                            gold_button("Again", Message::Grade(retention_popup::Grade::Again)),
-                            gold_button("Hard", Message::Grade(retention_popup::Grade::Hard)),
-                            gold_button("Good", Message::Grade(retention_popup::Grade::Good)),
-                            gold_button("Easy", Message::Grade(retention_popup::Grade::Easy)),
+                            card_button("Again", Message::Grade(retention_popup::Grade::Again)),
+                            card_button("Hard", Message::Grade(retention_popup::Grade::Hard)),
+                            card_button("Good", Message::Grade(retention_popup::Grade::Good)),
+                            card_button("Easy", Message::Grade(retention_popup::Grade::Easy)),
                         ]
                         .spacing(8),
                     ]
@@ -1132,7 +1091,7 @@ impl App {
                 } else {
                     column![
                         reading(&[prompt]),
-                        gold_button("Show answer", Message::ShowAnswer),
+                        card_button("Show answer", Message::ShowAnswer),
                     ]
                     .spacing(12)
                     .width(Length::Fill)
@@ -1153,7 +1112,7 @@ impl App {
                 }
                 column![
                     scrollable(body).width(Length::Fill).height(Length::Fill),
-                    gold_button("Continue", Message::Continue),
+                    card_button("Continue", Message::Continue),
                 ]
                 .spacing(12)
                 .width(Length::Fill)
@@ -1232,47 +1191,39 @@ fn mark_span(
         .color(FG)
 }
 
-fn night_fill() -> Linear {
-    Linear::new(Radians(1.15))
-        .add_stop(0.0, Color::from_rgb8(0x3a, 0x22, 0x58))
-        .add_stop(0.45, Color::from_rgb8(0x1c, 0x16, 0x32))
-        .add_stop(1.0, Color::from_rgb8(0x10, 0x12, 0x1e))
-}
-
-fn gold_style(on: bool, status: button::Status) -> button::Style {
-    let hot = on || status == button::Status::Hovered;
+fn control_style(on: bool, status: button::Status, radius: f32) -> button::Style {
     button::Style {
-        background: Some(Background::Color(if on {
-            GOLD
-        } else if hot {
-            Color::from_rgba8(0xe8, 0xc3, 0x72, 0.16)
+        background: if on {
+            Some(Background::Color(ACCENT))
+        } else if status == button::Status::Hovered {
+            Some(Background::Color(Color::from_rgb8(0x2e, 0x30, 0x38)))
         } else {
-            Color::from_rgba8(0, 0, 0, 0.28)
-        })),
-        text_color: if on { INK } else { GOLD },
+            None
+        },
+        text_color: if on { ON_ACCENT } else { FG },
         border: Border {
-            radius: 12.0.into(),
+            radius: radius.into(),
             width: 1.0,
-            color: if hot { GOLD_HOT } else { GOLD },
+            color: if on { ACCENT } else { LINE },
         },
         ..button::Style::default()
     }
 }
 
 fn action(label: impl Into<String>, message: Message) -> Element<'static, Message> {
-    button(text(label.into()).size(14).color(GOLD))
+    button(text(label.into()).size(14).color(FG))
         .on_press(message)
         .padding([8, 12])
-        .style(|_, status| gold_style(false, status))
+        .style(|_, status| control_style(false, status, 8.0))
         .into()
 }
 
 fn wide(label: impl Into<String>, message: Message) -> Element<'static, Message> {
-    button(text(label.into()).size(14).color(GOLD))
+    button(text(label.into()).size(14).color(FG))
         .on_press(message)
         .width(Length::Fill)
         .padding([8, 12])
-        .style(|_, status| gold_style(false, status))
+        .style(|_, status| control_style(false, status, 8.0))
         .into()
 }
 
@@ -1293,12 +1244,12 @@ fn nav_button(
     button(
         text(label.into())
             .size(14)
-            .color(if on { INK } else { GOLD }),
+            .color(if on { ON_ACCENT } else { FG }),
     )
     .on_press(message)
     .width(width)
     .padding([8, 12])
-    .style(move |_, status| gold_style(on, status))
+    .style(move |_, status| control_style(on, status, 8.0))
     .into()
 }
 
@@ -1343,111 +1294,45 @@ fn catalog_status(err: library::Error) -> &'static str {
 }
 
 fn chip(label: &str, on: bool, message: Message) -> Element<'_, Message> {
-    button(text(label).size(14))
+    button(text(label).size(14).color(if on { ON_ACCENT } else { FG }))
         .on_press(message)
-        .style(move |_, status| {
-            let fill = if on {
-                ACCENT
-            } else if status == button::Status::Hovered {
-                Color::from_rgb8(0x2f, 0x35, 0x4d)
-            } else {
-                BG
-            };
-            button::Style {
-                background: Some(Background::Color(fill)),
-                text_color: if on { BG } else { FG },
-                border: Border {
-                    radius: 10.0.into(),
-                    width: 1.0,
-                    color: if on { ACCENT } else { LINE },
-                },
-                ..button::Style::default()
-            }
-        })
+        .style(move |_, status| control_style(on, status, 10.0))
         .into()
 }
 
 fn quest_card(inner: Element<'_, Message>) -> Element<'_, Message> {
-    let fill = night_fill();
-
     container(inner)
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(22)
-        .style(move |_| container::Style {
-            background: Some(Background::from(fill)),
+        .style(|_| container::Style {
+            background: Some(Background::Color(BG)),
             text_color: Some(FG),
             border: Border {
-                color: GOLD,
-                width: 1.5,
-                radius: 22.0.into(),
-            },
-            shadow: Shadow {
-                color: Color {
-                    r: 0.91,
-                    g: 0.76,
-                    b: 0.45,
-                    a: 0.28,
-                },
-                offset: Vector::new(0.0, 14.0),
-                blur_radius: 32.0,
+                color: LINE,
+                width: 1.0,
+                radius: 12.0.into(),
             },
             ..Default::default()
         })
         .into()
 }
 
-fn gold_button<'a>(label: &'a str, message: Message) -> Element<'a, Message> {
-    button(text(label).size(16).color(GOLD))
+fn card_button<'a>(label: &'a str, message: Message) -> Element<'a, Message> {
+    button(text(label).size(16).color(FG))
         .on_press(message)
         .width(Length::Fill)
         .padding([8, 12])
-        .style(|_, status| button::Style {
-            background: Some(Background::Color(Color::from_rgba8(
-                0xe8,
-                0xc3,
-                0x72,
-                if status == button::Status::Hovered {
-                    0.18
-                } else {
-                    0.0
-                },
-            ))),
-            text_color: GOLD,
-            border: Border {
-                radius: 12.0.into(),
-                width: 1.0,
-                color: GOLD,
-            },
-            ..button::Style::default()
-        })
+        .style(|_, status| control_style(false, status, 12.0))
         .into()
 }
 
 fn choice_row<'a>(label: &'a str, on: bool, message: Message) -> Element<'a, Message> {
-    button(text(label).size(16).color(if on { INK } else { GOLD }))
+    button(text(label).size(16).color(if on { ON_ACCENT } else { FG }))
         .on_press(message)
         .width(Length::Fill)
         .padding(10)
-        .style(move |_, status| {
-            let hot = on || status == button::Status::Hovered;
-            button::Style {
-                background: Some(Background::Color(if on {
-                    GOLD
-                } else if hot {
-                    Color::from_rgba8(0xe8, 0xc3, 0x72, 0.14)
-                } else {
-                    Color::from_rgba8(0, 0, 0, 0.28)
-                })),
-                text_color: if on { INK } else { GOLD },
-                border: Border {
-                    radius: 14.0.into(),
-                    width: 1.0,
-                    color: if hot { GOLD_HOT } else { GOLD },
-                },
-                ..button::Style::default()
-            }
-        })
+        .style(move |_, status| control_style(on, status, 14.0))
         .into()
 }
 
