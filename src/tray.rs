@@ -23,8 +23,6 @@ pub struct TrayHandle {
 
 struct Shared {
     ready: AtomicBool,
-    visible: Mutex<bool>,
-    commands: std::sync::mpsc::Sender<bool>,
     events: Mutex<Option<UnboundedReceiver<TrayEvent>>>,
 }
 
@@ -38,19 +36,6 @@ impl TrayHandle {
 
     pub fn ready(&self) -> bool {
         self.shared.ready.load(Ordering::Acquire)
-    }
-
-    pub fn set_visible(&self, visible: bool) {
-        {
-            let mut current = self.shared.visible.lock().expect("tray visibility");
-            if *current == visible {
-                return;
-            }
-            *current = visible;
-        }
-        if self.ready() {
-            let _ = self.shared.commands.send(visible);
-        }
     }
 }
 
@@ -77,19 +62,16 @@ fn event_stream() -> impl Stream<Item = TrayEvent> + Send + 'static {
 }
 
 fn spawn_shared() -> Arc<Shared> {
-    let (commands, command_rx) = std::sync::mpsc::channel();
     let (events_tx, events_rx) = mpsc::unbounded();
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let shared = Arc::new(Shared {
         ready: AtomicBool::new(false),
-        visible: Mutex::new(false),
-        commands,
         events: Mutex::new(Some(events_rx)),
     });
     let thread_shared = Arc::clone(&shared);
     let spawned = std::thread::Builder::new()
         .name("retention-tray".into())
-        .spawn(move || serve(thread_shared, events_tx, command_rx, started_tx));
+        .spawn(move || serve(thread_shared, events_tx, started_tx));
     if spawned.is_ok() {
         let _ = started_rx.recv().unwrap_or(false);
     }
@@ -99,11 +81,14 @@ fn spawn_shared() -> Arc<Shared> {
 fn serve(
     shared: Arc<Shared>,
     events: UnboundedSender<TrayEvent>,
-    commands: std::sync::mpsc::Receiver<bool>,
     started: std::sync::mpsc::Sender<bool>,
 ) {
-    let visible = *shared.visible.lock().expect("tray visibility");
-    let handle = match (RetentionTray { events, visible }).spawn() {
+    // The shell's tray host can come up after this process. Stay registered
+    // and attach when the watcher appears, instead of exiting at login.
+    let handle = match (RetentionTray { events })
+        .assume_sni_available(true)
+        .spawn()
+    {
         Ok(handle) => handle,
         Err(err) => {
             eprintln!("tray spawn failed: {err}");
@@ -113,14 +98,14 @@ fn serve(
     };
     shared.ready.store(true, Ordering::Release);
     let _ = started.send(true);
-    while let Ok(visible) = commands.recv() {
-        let _ = handle.update(|tray| tray.visible = visible);
-    }
+    // The service runs on ksni's runtime. Hold the handle so this thread
+    // outlives the registration.
+    std::thread::park();
+    drop(handle);
 }
 
 struct RetentionTray {
     events: UnboundedSender<TrayEvent>,
-    visible: bool,
 }
 
 impl RetentionTray {
@@ -147,11 +132,8 @@ impl Tray for RetentionTray {
     }
 
     fn status(&self) -> Status {
-        if self.visible {
-            Status::Active
-        } else {
-            Status::Passive
-        }
+        // Omarchy's bar skips Passive items, so an idle item never appears.
+        Status::Active
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
@@ -160,7 +142,8 @@ impl Tray for RetentionTray {
 
     fn tool_tip(&self) -> ToolTip {
         ToolTip {
-            title: "Retention is in the background".into(),
+            title: "Retention".into(),
+            description: "Open or quit".into(),
             ..ToolTip::default()
         }
     }
@@ -233,15 +216,13 @@ mod tests {
     #[test]
     fn left_click_opens_and_the_menu_quits() {
         let (tx, mut rx) = mpsc::unbounded();
-        let mut tray = RetentionTray {
-            events: tx,
-            visible: false,
-        };
+        let mut tray = RetentionTray { events: tx };
         assert_eq!(tray.id(), "retention-popup");
         assert_eq!(tray.title(), "Retention");
         assert_eq!(tray.category(), Category::ApplicationStatus);
-        assert_eq!(tray.status(), Status::Passive);
-        assert_eq!(tray.tool_tip().title, "Retention is in the background");
+        assert_eq!(tray.status(), Status::Active);
+        assert_eq!(tray.tool_tip().title, "Retention");
+        assert_eq!(tray.tool_tip().description, "Open or quit");
         assert_eq!(tray.icon_pixmap().len(), 1);
 
         tray.activate(0, 0);
@@ -263,8 +244,5 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(TrayEvent::Open));
         assert_eq!(rx.try_recv(), Ok(TrayEvent::Quit));
         assert!(rx.try_recv().is_err());
-
-        tray.visible = true;
-        assert_eq!(tray.status(), Status::Active);
     }
 }

@@ -1,6 +1,8 @@
 //! Control card, and a due card in the corner you picked.
 
 mod desk;
+mod editor;
+mod host;
 mod library;
 mod markdown;
 mod review;
@@ -135,17 +137,7 @@ struct App {
     offset: i64,
     review: review::Review,
     data: Option<PathBuf>,
-    catalog: library::Catalog,
-    selected: Option<String>,
-    draft_open: bool,
-    draft_start: i64,
-    draft_end: i64,
-    draft_gap: i64,
-    status: String,
-    place: Place,
-    name_draft: String,
-    pending: Option<Pending>,
-    shell_id: Option<iced::window::Id>,
+    editor: editor::Editor,
     desk: desk::Desk<iced::window::Id>,
     popup_id: Option<iced::window::Id>,
     tray: tray::TrayHandle,
@@ -160,25 +152,6 @@ fn corner_anchor(corner: review::Corner) -> Anchor {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Place {
-    Libraries,
-    Inside(Focus),
-    Settings,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Focus {
-    Library,
-    Deck(String),
-    Notes,
-}
-
-enum Pending {
-    Root(String),
-    Deck(String),
-}
-
 #[to_layer_message(multi)]
 #[derive(Debug, Clone)]
 enum Message {
@@ -190,7 +163,6 @@ enum Message {
     Grade(retention_popup::Grade),
     Quit,
     NewRoot,
-    SelectDeck(String),
     NewDeck,
     SetInherit,
     OpenDraft,
@@ -200,7 +172,6 @@ enum Message {
     EndDown,
     GapUp,
     GapDown,
-    Save,
     Import(String),
     Export,
     Libraries,
@@ -232,26 +203,16 @@ impl App {
         if let (Some(dir), Some(id)) = (data.as_ref(), chosen.as_ref()) {
             let _ = review.load(dir, id);
         }
-        let mut catalog = library::Catalog::load(data.as_deref().unwrap_or(Path::new("")));
+        let mut editor = editor::Editor::load(data.as_deref().unwrap_or(Path::new("")));
         if let Some(id) = &chosen {
-            let _ = catalog.open(id);
+            editor.open_saved(id);
         }
         Self {
             offset: startup_offset(),
             review,
             data,
-            catalog,
-            selected: None,
-            draft_open: false,
-            draft_start: 540,
-            draft_end: 1080,
-            draft_gap: 45,
-            status: String::new(),
-            place: Place::Libraries,
-            name_draft: String::new(),
-            pending: None,
-            shell_id: None,
-            desk: desk::Desk::Absent,
+            editor,
+            desk: desk::Desk::absent(),
             popup_id: None,
             tray: tray::TrayHandle::start(),
         }
@@ -285,123 +246,94 @@ impl App {
             Message::Continue => self.commit_review(),
             Message::Grade(grade) => self.grade(grade),
             Message::Quit => iced::exit(),
-            Message::NewRoot => match self.catalog.create_root() {
-                Ok(id) => self.edit_root(id),
-                Err(err) => {
-                    let _ = self.finish(Err(err));
-                    Task::none()
-                }
-            },
-            Message::SelectDeck(name) => {
-                self.selected = Some(name);
-                self.draft_open = false;
-                Task::none()
+            Message::NewRoot => {
+                let follow = self.editor.new_root();
+                self.follow(follow)
             }
-            Message::NewDeck => match self.catalog.create_deck() {
-                Ok(name) => {
-                    let _ = self.finish(Ok(()));
-                    self.edit_deck(name)
-                }
-                Err(err) => {
-                    let _ = self.finish(Err(err));
-                    Task::none()
-                }
-            },
+            Message::NewDeck => {
+                let follow = self.editor.new_deck();
+                self.follow(follow)
+            }
             Message::SetInherit => {
-                self.draft_open = false;
+                self.editor.show_inherit();
                 Task::none()
             }
             Message::OpenDraft => {
-                self.draft_open = true;
+                self.editor.show_override();
                 Task::none()
             }
             Message::StartUp => {
-                self.draft_start = slide(self.draft_start, 30, 0, 1440);
+                self.editor.nudge(editor::Step::Start, true);
                 Task::none()
             }
             Message::StartDown => {
-                self.draft_start = slide(self.draft_start, -30, 0, 1440);
+                self.editor.nudge(editor::Step::Start, false);
                 Task::none()
             }
             Message::EndUp => {
-                self.draft_end = slide(self.draft_end, 30, 0, 1440);
+                self.editor.nudge(editor::Step::End, true);
                 Task::none()
             }
             Message::EndDown => {
-                self.draft_end = slide(self.draft_end, -30, 0, 1440);
+                self.editor.nudge(editor::Step::End, false);
                 Task::none()
             }
             Message::GapUp => {
-                self.draft_gap = slide(self.draft_gap, 5, 1, 1440);
+                self.editor.nudge(editor::Step::Gap, true);
                 Task::none()
             }
             Message::GapDown => {
-                self.draft_gap = slide(self.draft_gap, -5, 1, 1440);
-                Task::none()
-            }
-            Message::Save => {
-                let Some(deck) = self.selected.clone() else {
-                    return Task::none();
-                };
-                let saved = self.catalog.set_override(
-                    &deck,
-                    self.draft_start,
-                    self.draft_end,
-                    self.draft_gap,
-                );
-                if self.finish(saved) {
-                    self.draft_open = false;
-                }
+                self.editor.nudge(editor::Step::Gap, false);
                 Task::none()
             }
             Message::Import(name) => {
-                let imported = self.catalog.import_inbox(&name);
-                let _ = self.finish(imported);
-                Task::none()
+                let follow = self.editor.import(&name);
+                self.follow(follow)
             }
             Message::Export => {
-                let exported = self.catalog.export_notes().map(|_| ());
-                let _ = self.finish(exported);
-                Task::none()
+                let follow = self.editor.export();
+                self.follow(follow)
             }
             Message::Libraries => {
-                self.place = Place::Libraries;
-                self.pending = None;
+                self.editor.libraries();
                 Task::none()
             }
             Message::Settings => {
-                self.place = Place::Settings;
-                self.pending = None;
+                self.editor.settings();
                 Task::none()
             }
             Message::Notes => {
-                self.place = Place::Inside(Focus::Notes);
-                self.pending = None;
+                self.editor.notes();
                 Task::none()
             }
             Message::NameChanged(value) => {
-                self.name_draft = value;
+                self.editor.set_name(value);
                 Task::none()
             }
-            Message::SavePage => self.save_page(),
-            Message::EditRoot(id) => self.edit_root(id),
-            Message::EditDeck(name) => self.edit_deck(name),
+            Message::SavePage => {
+                let follow = self.editor.save_page();
+                self.follow(follow)
+            }
+            Message::EditRoot(id) => {
+                let follow = self.editor.open_root(&id);
+                self.follow(follow)
+            }
+            Message::EditDeck(name) => {
+                self.editor.edit_deck(&name);
+                Task::none()
+            }
             Message::AskDelete => {
-                self.pending = match &self.place {
-                    Place::Inside(Focus::Library) => self
-                        .catalog
-                        .open_id()
-                        .map(|id| Pending::Root(id.to_string())),
-                    Place::Inside(Focus::Deck(_)) => self.selected.clone().map(Pending::Deck),
-                    _ => None,
-                };
+                self.editor.ask_delete();
                 Task::none()
             }
             Message::CancelDelete => {
-                self.pending = None;
+                self.editor.cancel_delete();
                 Task::none()
             }
-            Message::ConfirmDelete => self.confirm_delete(),
+            Message::ConfirmDelete => {
+                let follow = self.editor.confirm_delete();
+                self.follow(follow)
+            }
             Message::Opened(id) => self.opened(id),
             Message::Boot => self.apply_desk(desk::DeskInput::ShellReady),
             Message::Background => self.apply_desk(desk::DeskInput::Background),
@@ -414,24 +346,24 @@ impl App {
                     self.apply_desk(desk::DeskInput::Close(id))
                 }
             }
-            Message::Drag => match self.desk {
-                desk::Desk::Shown(id) => iced::window::drag(id),
-                _ => Task::none(),
+            Message::Drag => match self.desk.drag_id() {
+                Some(id) => iced::window::drag(id),
+                None => Task::none(),
             },
             _ => Task::none(),
         }
     }
 
-    fn finish(&mut self, result: Result<(), library::Error>) -> bool {
-        match result {
-            Ok(()) => {
-                self.status.clear();
+    fn follow(&mut self, follow: editor::Follow) -> Task<Message> {
+        match follow {
+            editor::Follow::Stay => Task::none(),
+            editor::Follow::Reload => {
                 self.reload_study();
-                true
+                Task::none()
             }
-            Err(err) => {
-                self.status = catalog_status(err).to_string();
-                false
+            editor::Follow::ReloadAndClose => {
+                self.reload_study();
+                self.dismiss()
             }
         }
     }
@@ -440,7 +372,7 @@ impl App {
         let Some(dir) = self.data.clone() else {
             return;
         };
-        let Some(id) = self.catalog.open_id().map(str::to_string) else {
+        let Some(id) = self.editor.catalog().open_id().map(str::to_string) else {
             let _ = self.review.load(&dir, "");
             return;
         };
@@ -510,145 +442,26 @@ impl App {
         }
     }
 
-    fn edit_root(&mut self, id: String) -> Task<Message> {
-        let opened = self.catalog.open(&id);
-        if self.finish(opened) {
-            self.name_draft = id;
-            if let Ok(rules) = self.catalog.root_rules() {
-                self.draft_start = rules.start;
-                self.draft_end = rules.end;
-                self.draft_gap = rules.gap;
-            }
-            self.place = Place::Inside(Focus::Library);
-            self.pending = None;
-            self.selected = None;
-        }
-        Task::none()
-    }
-
-    fn edit_deck(&mut self, name: String) -> Task<Message> {
-        let row = self
-            .catalog
-            .decks()
-            .iter()
-            .find(|deck| deck.name == name)
-            .cloned();
-        let Some(row) = row else {
-            return Task::none();
-        };
-        if let library::DeliveryChoice::Override { start, end, gap } = row.delivery {
-            self.draft_start = start;
-            self.draft_end = end;
-            self.draft_gap = gap;
-            self.draft_open = true;
-        } else {
-            self.draft_open = false;
-        }
-        self.selected = Some(name.clone());
-        self.name_draft = name.clone();
-        self.place = Place::Inside(Focus::Deck(name));
-        self.pending = None;
-        self.status.clear();
-        Task::none()
-    }
-
-    fn save_page(&mut self) -> Task<Message> {
-        if matches!(&self.place, Place::Inside(Focus::Library)) {
-            let Some(id) = self.catalog.open_id().map(str::to_string) else {
-                return Task::none();
-            };
-            let renamed = if self.name_draft.trim() != id {
-                self.catalog.rename_root(&id, &self.name_draft)
-            } else {
-                Ok(())
-            };
-            if !self.finish(renamed) {
-                return Task::none();
-            }
-            let saved =
-                self.catalog
-                    .set_root_rules(self.draft_start, self.draft_end, self.draft_gap);
-            let _ = self.finish(saved);
-            return Task::none();
-        }
-        if matches!(&self.place, Place::Inside(Focus::Deck(_))) {
-            let Some(name) = self.selected.clone() else {
-                return Task::none();
-            };
-            let renamed = if self.name_draft.trim() != name {
-                self.catalog.rename_deck(&name, &self.name_draft)
-            } else {
-                Ok(())
-            };
-            if !self.finish(renamed) {
-                return Task::none();
-            }
-            let current = if self.name_draft.trim() != name {
-                self.name_draft.trim().to_string()
-            } else {
-                name
-            };
-            self.selected = Some(current.clone());
-            self.place = Place::Inside(Focus::Deck(current.clone()));
-            let saved = if self.draft_open {
-                self.catalog.set_override(
-                    &current,
-                    self.draft_start,
-                    self.draft_end,
-                    self.draft_gap,
-                )
-            } else {
-                self.catalog.set_inherit(&current)
-            };
-            let _ = self.finish(saved);
-        }
-        Task::none()
-    }
-
-    fn confirm_delete(&mut self) -> Task<Message> {
-        let Some(pending) = self.pending.take() else {
-            return Task::none();
-        };
-        match pending {
-            Pending::Root(id) => {
-                let removed = self.catalog.delete_root(&id);
-                if self.finish(removed) && self.catalog.open_id().is_none() {
-                    self.place = Place::Libraries;
-                    self.selected = None;
-                    return self.dismiss();
-                }
-            }
-            Pending::Deck(name) => {
-                let removed = self.catalog.delete_deck(&name);
-                if self.finish(removed) {
-                    self.selected = None;
-                    self.place = Place::Inside(Focus::Library);
-                    if let Some(id) = self.catalog.open_id().map(str::to_string) {
-                        return self.edit_root(id);
-                    }
-                }
-            }
-        }
-        Task::none()
-    }
-
     fn opened(&mut self, id: iced::window::Id) -> Task<Message> {
         if self.popup_id == Some(id) {
             return Task::none();
         }
-        let desk_window = match self.desk {
-            desk::Desk::Opening(open) if open == id => true,
-            desk::Desk::Shown(shown) if shown == id => true,
+        let desk_window = match self.desk.phase() {
+            desk::Phase::Opening(open) if open == id => true,
+            desk::Phase::Shown(shown) if shown == id => true,
             _ => false,
         };
         if desk_window {
             return self.apply_desk(desk::DeskInput::WindowOpened(id));
         }
-        if self.shell_id.is_none() {
-            self.shell_id = Some(id);
-        }
-        if matches!(self.desk, desk::Desk::Shown(_)) {
-            return self.remove_shell();
+        let _ = self.apply_desk(desk::DeskInput::ShellSeen(id));
+        if self.desk.drag_id().is_some() {
+            let (desk, shell) = self.desk.take_shell();
+            self.desk = desk;
+            return match shell {
+                Some(shell) => Task::done(Message::RemoveWindow(shell)),
+                None => Task::none(),
+            };
         }
         self.apply_desk(desk::DeskInput::ShellReady)
     }
@@ -662,46 +475,39 @@ impl App {
         for effect in effects {
             match effect {
                 desk::DeskEffect::OpenWindow => {
-                    if matches!(before, desk::Desk::Absent | desk::Desk::Hidden) {
+                    if matches!(
+                        before.phase(),
+                        desk::Phase::Absent | desk::Phase::Hidden
+                    ) {
                         let (id, task) = Message::base_window_open(
                             iced_layershell::actions::IcedXdgWindowSettings {
                                 size: Some((960, 680)),
                                 client_side_decorations: false,
                             },
                         );
-                        self.desk = desk::Desk::Opening(id);
+                        let (desk, _) =
+                            desk::step(self.desk, desk::DeskInput::Reserved(id), self.tray.ready());
+                        self.desk = desk;
                         tasks.push(task);
                     }
                 }
                 desk::DeskEffect::CloseWindow(id) => {
                     tasks.push(Task::done(Message::RemoveWindow(id)));
                 }
-                desk::DeskEffect::RemoveShell => {
-                    if let Some(shell) = self.shell_id.take() {
-                        tasks.push(Task::done(Message::RemoveWindow(shell)));
-                    }
+                desk::DeskEffect::RemoveShell(id) => {
+                    tasks.push(Task::done(Message::RemoveWindow(id)));
                 }
                 desk::DeskEffect::Exit => tasks.push(iced::exit()),
                 desk::DeskEffect::Refuse => {
                     refused = true;
-                    self.status = "Tray is not available".into();
+                    self.editor.set_status("Tray is not available");
                 }
             }
         }
         if matches!(input, desk::DeskInput::Background) && !refused {
-            self.status.clear();
-        }
-        if !refused {
-            self.tray.set_visible(desk::tray_visible(&self.desk));
+            self.editor.clear_status();
         }
         Task::batch(tasks)
-    }
-
-    fn remove_shell(&mut self) -> Task<Message> {
-        match self.shell_id.take() {
-            Some(shell) => Task::done(Message::RemoveWindow(shell)),
-            None => Task::none(),
-        }
     }
 
     fn desktop(&self) -> Element<'_, Message> {
@@ -717,8 +523,8 @@ impl App {
     }
 
     fn top_bar(&self) -> Element<'_, Message> {
-        let inside = matches!(&self.place, Place::Inside(_));
-        let open = self.catalog.open_id().map(str::to_string);
+        let inside = matches!(self.editor.place(), editor::Place::Inside(_));
+        let open = self.editor.catalog().open_id().map(str::to_string);
         let mut bar = Row::new()
             .spacing(8)
             .align_y(iced::Alignment::Center)
@@ -726,16 +532,16 @@ impl App {
             .push(text("Retention").size(20).color(FG))
             .push(bar_item(
                 "Libraries",
-                matches!(&self.place, Place::Libraries),
+                matches!(self.editor.place(), editor::Place::Libraries),
                 Message::Libraries,
             ));
-        for id in self.catalog.root_ids() {
+        for id in self.editor.catalog().root_ids() {
             let on = inside && open.as_deref() == Some(id.as_str());
             bar = bar.push(bar_item(id.clone(), on, Message::EditRoot(id.clone())));
         }
         bar = bar.push(bar_item(
             "Settings",
-            matches!(&self.place, Place::Settings),
+            matches!(self.editor.place(), editor::Place::Settings),
             Message::Settings,
         ));
         mouse_area(
@@ -753,10 +559,10 @@ impl App {
     }
 
     fn rail(&self) -> Element<'_, Message> {
-        let open_here = matches!(&self.place, Place::Inside(_));
-        let notes = matches!(&self.place, Place::Inside(Focus::Notes));
-        let deck_name = match &self.place {
-            Place::Inside(Focus::Deck(name)) => Some(name.clone()),
+        let open_here = matches!(self.editor.place(), editor::Place::Inside(_));
+        let notes = matches!(self.editor.place(), editor::Place::Inside(editor::Focus::Notes));
+        let deck_name = match self.editor.place() {
+            editor::Place::Inside(editor::Focus::Deck(name)) => Some(name.clone()),
             _ => None,
         };
         let mut items = Column::new()
@@ -764,7 +570,7 @@ impl App {
             .height(Length::Fill)
             .width(Length::Fill);
         if open_here {
-            for deck in self.catalog.decks() {
+            for deck in self.editor.catalog().decks() {
                 let on = deck_name.as_deref() == Some(deck.name.as_str());
                 items = items.push(marked(
                     deck.name.clone(),
@@ -775,7 +581,7 @@ impl App {
             items = items.push(marked("Notes", notes, Message::Notes));
             items = items.push(wide("New deck", Message::NewDeck));
         } else {
-            for id in self.catalog.root_ids() {
+            for id in self.editor.catalog().root_ids() {
                 items = items.push(marked(id.clone(), false, Message::EditRoot(id.clone())));
             }
             items = items.push(wide("New library", Message::NewRoot));
@@ -798,8 +604,8 @@ impl App {
         let mut body = Column::new().spacing(12).width(Length::Fill);
         body = body.push(text(self.page_title()).size(26).color(FG));
         body = body.push(text(self.page_line()).size(14).color(MUTED));
-        if !self.status.is_empty() {
-            body = body.push(text(&self.status).size(14).color(ACCENT));
+        if !self.editor.status().is_empty() {
+            body = body.push(text(self.editor.status()).size(14).color(ACCENT));
         }
         body = body.push(self.page_content());
         container(scrollable(body))
@@ -815,42 +621,44 @@ impl App {
     }
 
     fn page_title(&self) -> String {
-        match &self.place {
-            Place::Libraries => "Libraries".to_string(),
-            Place::Inside(Focus::Library) => "Library".to_string(),
-            Place::Inside(Focus::Deck(name)) => name.clone(),
-            Place::Inside(Focus::Notes) => "Notes".to_string(),
-            Place::Settings => "Settings".to_string(),
+        match self.editor.place() {
+            editor::Place::Libraries => "Libraries".to_string(),
+            editor::Place::Inside(editor::Focus::Library) => "Library".to_string(),
+            editor::Place::Inside(editor::Focus::Deck(name)) => name.clone(),
+            editor::Place::Inside(editor::Focus::Notes) => "Notes".to_string(),
+            editor::Place::Settings => "Settings".to_string(),
         }
     }
 
     fn page_line(&self) -> &'static str {
-        match &self.place {
-            Place::Libraries => "Each library has its own cards and schedule.",
-            Place::Inside(Focus::Library) => "Cards from this library appear between these times.",
-            Place::Inside(Focus::Deck(_)) => {
+        match self.editor.place() {
+            editor::Place::Libraries => "Each library has its own cards and schedule.",
+            editor::Place::Inside(editor::Focus::Library) => {
+                "Cards from this library appear between these times."
+            }
+            editor::Place::Inside(editor::Focus::Deck(_)) => {
                 "Use the library schedule, or set times for this deck only."
             }
-            Place::Inside(Focus::Notes) => {
+            editor::Place::Inside(editor::Focus::Notes) => {
                 "Put a .txt, .tsv, or .apkg file in the inbox, then choose it here."
             }
-            Place::Settings => "Due cards open in this corner.",
+            editor::Place::Settings => "Due cards open in this corner.",
         }
     }
 
     fn page_content(&self) -> Element<'_, Message> {
-        match self.place.clone() {
-            Place::Libraries => text("Choose a library.").size(14).color(MUTED).into(),
-            Place::Inside(Focus::Library) => self.root_page(),
-            Place::Inside(Focus::Deck(_)) => self.deck_page(),
-            Place::Inside(Focus::Notes) => self.import_page(),
-            Place::Settings => self.settings_page(),
+        match self.editor.place().clone() {
+            editor::Place::Libraries => text("Choose a library.").size(14).color(MUTED).into(),
+            editor::Place::Inside(editor::Focus::Library) => self.root_page(),
+            editor::Place::Inside(editor::Focus::Deck(_)) => self.deck_page(),
+            editor::Place::Inside(editor::Focus::Notes) => self.import_page(),
+            editor::Place::Settings => self.settings_page(),
         }
     }
 
     fn root_page(&self) -> Element<'_, Message> {
         column![
-            text_input("Name", &self.name_draft)
+            text_input("Name", self.editor.name())
                 .on_input(Message::NameChanged)
                 .padding(10)
                 .size(16)
@@ -866,20 +674,28 @@ impl App {
 
     fn deck_page(&self) -> Element<'_, Message> {
         let mut body = column![
-            text_input("Name", &self.name_draft)
+            text_input("Name", self.editor.name())
                 .on_input(Message::NameChanged)
                 .padding(10)
                 .size(16)
                 .width(Length::Fill),
             row![
-                marked("Library schedule", !self.draft_open, Message::SetInherit),
-                marked("Its own schedule", self.draft_open, Message::OpenDraft),
+                marked(
+                    "Library schedule",
+                    !self.editor.hours().own(),
+                    Message::SetInherit,
+                ),
+                marked(
+                    "Its own schedule",
+                    self.editor.hours().own(),
+                    Message::OpenDraft,
+                ),
             ]
             .spacing(8),
         ]
         .spacing(12)
         .width(Length::Fill);
-        if self.draft_open {
+        if self.editor.hours().own() {
             body = body.push(self.schedule_editor());
         }
         body.push(wide("Save", Message::SavePage))
@@ -888,11 +704,11 @@ impl App {
     }
 
     fn import_page(&self) -> Element<'_, Message> {
-        if self.catalog.open_id().is_none() {
+        if self.editor.catalog().open_id().is_none() {
             return text("Choose a library first.").size(14).color(MUTED).into();
         }
         let mut list = Column::new().spacing(8).width(Length::Fill);
-        let inbox = self.catalog.inbox();
+        let inbox = self.editor.catalog().inbox();
         if inbox.is_empty() {
             list = list.push(
                 text("Nothing is waiting in the inbox.")
@@ -948,21 +764,21 @@ impl App {
     fn schedule_editor(&self) -> Element<'_, Message> {
         column![
             draft_row(
-                format!("From {}", clock(self.draft_start)),
+                format!("From {}", clock(self.editor.hours().start())),
                 "Earlier",
                 Message::StartDown,
                 "Later",
                 Message::StartUp,
             ),
             draft_row(
-                format!("Until {}", clock(self.draft_end)),
+                format!("Until {}", clock(self.editor.hours().end())),
                 "Earlier",
                 Message::EndDown,
                 "Later",
                 Message::EndUp,
             ),
             draft_row(
-                every(self.draft_gap),
+                every(self.editor.hours().gap()),
                 "Shorter",
                 Message::GapDown,
                 "Longer",
@@ -975,11 +791,19 @@ impl App {
 
     fn delete_row(&self) -> Element<'_, Message> {
         let asking = matches!(
-            (&self.pending, &self.place),
-            (Some(Pending::Root(_)), Place::Inside(Focus::Library))
-                | (Some(Pending::Deck(_)), Place::Inside(Focus::Deck(_)))
+            (self.editor.pending(), self.editor.place()),
+            (
+                Some(editor::Pending::Root(_)),
+                editor::Place::Inside(editor::Focus::Library)
+            ) | (
+                Some(editor::Pending::Deck(_)),
+                editor::Place::Inside(editor::Focus::Deck(_))
+            )
         );
-        let (label, confirm) = if matches!(&self.place, Place::Inside(Focus::Deck(_))) {
+        let (label, confirm) = if matches!(
+            self.editor.place(),
+            editor::Place::Inside(editor::Focus::Deck(_))
+        ) {
             ("Delete deck", "Delete this deck")
         } else {
             ("Delete library", "Delete this library")
@@ -1195,10 +1019,6 @@ fn draft_row(
     .into()
 }
 
-fn slide(value: i64, step: i64, low: i64, high: i64) -> i64 {
-    value.saturating_add(step).clamp(low, high)
-}
-
 fn clock(minutes: i64) -> String {
     let minutes = minutes.clamp(0, 1440);
     format!("{:02}:{:02}", minutes / 60, minutes % 60)
@@ -1206,17 +1026,6 @@ fn clock(minutes: i64) -> String {
 
 fn every(minutes: i64) -> String {
     format!("Every {minutes} min")
-}
-
-fn catalog_status(err: library::Error) -> &'static str {
-    match err {
-        library::Error::BadWindow => "The end has to be after the start.",
-        library::Error::MissingRoot => "Choose a library first.",
-        library::Error::MissingDeck => "That deck is gone.",
-        library::Error::BadFileName => "That file cannot be imported.",
-        library::Error::Failed => "That did not work.",
-        library::Error::Exists => "That name is already used.",
-    }
 }
 
 fn chip(label: &str, on: bool, message: Message) -> Element<'_, Message> {
